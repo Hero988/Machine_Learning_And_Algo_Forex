@@ -1,0 +1,13 @@
+use trading enviroment or backtesting software and make sure to change the names of High and Low to high and low
+
+add the backtesting for MLP to see how it does in the live market on the evaluation i.e. use model.eval and 
+if 1 then buy and close once the next candle opens and if -1 sell and close once the next candle opens
+do it for the 90% one fore now on EURUSD daily - second
+i.e. the RegressionBasedStrategy how we done it before (Maybe use my data for the indicators? i know i need to do it for 
+sales_data_previous e.t.c)
+
+Use the forex trading enviroment that I created before to test this out
+
+add feature importance and find features which are hindering the model and take out those out - fourth
+
+add ensemble i.e. a voting mechanism - third
