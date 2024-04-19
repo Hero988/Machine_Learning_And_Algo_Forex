@@ -40,9 +40,9 @@ class MLPModel(torch.nn.Module):
 def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
 
     # Define your MetaTrader 5 account number
-    account_number = 530062481
+    account_number = 530064788
     # Define your MetaTrader 5 password
-    password = 'N?G9rPt@'
+    password = 'fe5@6YV*'
     # Define the server name associated with your MT5 account
     server_name ='FTMO-Server3'
 
@@ -539,7 +539,7 @@ def predict_next_futures():
     # Optionally, return the prediction or handle it as needed
     return predicted_movement
 
-def find_recent_forex_agent_dir_by_pair(pair='EURUSD', base_dir=None):
+def find_recent_forex_agent_dir(pair='EURUSD', timeframe='DAILY', base_dir=None):
     # Use the current working directory if no base_dir is provided
     if base_dir is None:
         base_dir = os.getcwd()
@@ -553,8 +553,8 @@ def find_recent_forex_agent_dir_by_pair(pair='EURUSD', base_dir=None):
     # List all items in the base directory
     dirs = os.listdir(base_dir)
 
-    # Filter out directories that contain the specific pair and start with 'agent_forex'
-    forex_dirs = [d for d in dirs if d.startswith('agent_forex') and pair in d and os.path.isdir(os.path.join(base_dir, d))]
+    # Filter out directories that contain the specific pair and timeframe, and start with 'agent_forex'
+    forex_dirs = [d for d in dirs if d.startswith('agent_forex') and pair in d and timeframe in d and os.path.isdir(os.path.join(base_dir, d))]
 
     # Sort directories by name, assuming names include sortable dates or increment numbers
     forex_dirs.sort(reverse=True)
@@ -589,9 +589,11 @@ def predict_next_forex(choice):
     start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
     end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
 
+    timeframe = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
+
     pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
 
-    folder_name = find_recent_forex_agent_dir_by_pair(pair)
+    folder_name = find_recent_forex_agent_dir(pair, timeframe)
 
     Pair, timeframe_str = extract_info_from_folder_name(folder_name)
 
@@ -604,17 +606,14 @@ def predict_next_forex(choice):
     # Apply technical indicators to the data using the 'calculate_indicators' function
     eur_usd_data = calculate_indicators(eur_usd_data, choice) 
 
-    # Filter the EUR/USD data for the in-sample training period
-    dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
-
     # Drop rows where any of the data is missing
-    dataset = dataset.dropna()
+    eur_usd_data = eur_usd_data.dropna()
 
-    dataset = dataset.drop(dataset.tail(1).index)
+    eur_usd_data = eur_usd_data.iloc[:-1]  # Drops the last row
 
-    dataset = dataset.reset_index()
+    eur_usd_data = eur_usd_data.reset_index()
 
-    latest_row = dataset.tail(1)
+    latest_row = eur_usd_data.tail(1)
 
     print(latest_row)
 
@@ -667,7 +666,7 @@ def predict_next_forex(choice):
     result_df = pd.DataFrame(data)
 
     # Define the path for the new CSV file within the specified folder
-    csv_file_path = os.path.join(folder_name, 'predictions.csv')
+    csv_file_path = os.path.join(folder_name, f'predictions_{timeframe_str}.csv')
 
     # Check if the file already exists
     if not os.path.exists(csv_file_path):
@@ -679,6 +678,17 @@ def predict_next_forex(choice):
 
     # Optionally, return the prediction or handle it as needed
     return predicted_movement
+
+def try_parse_datetime(input_str):
+    try:
+        # Try parsing as datetime first
+        return datetime.strptime(input_str, "%Y-%m-%d %H:%M:%S"), True
+    except ValueError:
+        try:
+            # If it fails, try parsing as date
+            return datetime.strptime(input_str, "%Y-%m-%d"), False
+        except ValueError:
+            return None, False
 
 def predict_specific(choice):
     # Retrieve and store the current date
@@ -693,9 +703,11 @@ def predict_specific(choice):
     start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
     end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
 
+    timeframe = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
+
     pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
 
-    folder_name = find_recent_forex_agent_dir_by_pair(pair)
+    folder_name = find_recent_forex_agent_dir(pair, timeframe)
 
     Pair, timeframe_str = extract_info_from_folder_name(folder_name)
 
@@ -718,10 +730,12 @@ def predict_specific(choice):
 
     # Requesting a specific date from the user
     user_date_str = input("Enter the date you want to predict for (YYYY-MM-DD): ")
-    try:
-        user_date = datetime.strptime(user_date_str, "%Y-%m-%d")
 
-        # Check if the date is within the dataset's range
+    user_date, is_datetime = try_parse_datetime(user_date_str)
+
+    if user_date is None:
+        print("Invalid format. Please enter the date in 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' format.")
+    else:
         if user_date in dataset.index:
             # Extract as DataFrame instead of Series
             specific_row = dataset.loc[[user_date]]
@@ -729,12 +743,8 @@ def predict_specific(choice):
             print("Data on selected date:")
             print(specific_row)
         else:
-            print("The specified date is not available in the dataset. Please choose another date within the range.")
-
-    except ValueError:
-        print("Invalid date format. Please enter the date in 'YYYY-MM-DD' format.")
-
-    scaler_path = get_scaler_path(folder_name)
+            print("The specified date or datetime is not available in the dataset. Please choose another within the range.")
+        scaler_path = get_scaler_path(folder_name)
 
     # Since this is a prediction for the future, we assume no 'Actual Movement' available
     # Prepare data (you need to ensure your preprocessing function can handle single row)
@@ -765,6 +775,118 @@ def predict_specific(choice):
     predicted_movement = np.where(predicted_class.numpy().flatten() == 0, -1, 1)[0]  # [0] to get a single value
 
     print(f'Predicted Movement is {predicted_movement}')
+
+def training_forex_multiple(choice, Pair, timeframe_str):
+    current_date = str(datetime.now().date())
+    strategy_start_date_all = "1971-01-04"
+    strategy_end_date_all = current_date
+
+    start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
+    end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
+
+    training_start_date = "2000-01-01"
+    training_end_date = current_date
+
+    eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
+    eur_usd_data = calculate_indicators(eur_usd_data, choice)
+    dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
+    dataset = dataset.dropna()
+
+    training_set, testing_set = split_and_save_dataset(dataset, timeframe_str, Pair)
+
+    batch_size=16
+
+    training_set = training_set.reset_index()
+    testing_set = testing_set.reset_index()
+
+    fit_and_save_scaler(training_set)
+
+    X_train, y_train = preprocess_data(training_set)
+    X_test, y_test = preprocess_data(testing_set)
+
+    # Convert to PyTorch tensors
+    X_train_tensor = torch.FloatTensor(X_train)
+    y_train_tensor = torch.FloatTensor(y_train).unsqueeze(1)  # BCELoss expects the same shape for input and target
+    X_test_tensor = torch.FloatTensor(X_test)
+    y_test_tensor = torch.FloatTensor(y_test).unsqueeze(1)
+
+    # Create DataLoader instances
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size)
+    val_loader = DataLoader(test_dataset, batch_size=batch_size)
+
+    model = MLPModel(input_size=X_train.shape[1])
+    loss_function = BCELoss()
+    optimizer = Adam(model.parameters(), lr=0.001)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+
+    epochs = 100  # Adjust number of epochs based on your dataset and early stopping criteria
+
+    # For storing metrics
+    train_losses = []
+    val_losses = []
+
+    patience = 10
+    min_delta = 0.01
+    best_val_loss = float('inf')
+    no_improvement_count = 0
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        for inputs, labels in train_loader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = loss_function(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                outputs = model(inputs)
+                loss = loss_function(outputs, labels)
+                val_loss += loss.item()
+
+        train_loss /= len(train_loader)
+        val_loss /= len(val_loader)
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+
+        scheduler.step(val_loss)  # Adjust learning rate based on the validation loss
+
+        if val_loss < best_val_loss - min_delta:
+            best_val_loss = val_loss
+            no_improvement_count = 0
+            torch.save(model.state_dict(), 'mlp_model.pth')
+            print("Validation loss decreased, saving model...")
+        else:
+            no_improvement_count += 1
+            print(f"No improvement in validation loss for {no_improvement_count} epochs")
+            if no_improvement_count >= patience:
+                print("Early stopping triggered")
+                break
+
+    print("Training completed. Best model saved as 'mlp_model.pth'.")
+
+    evaluate(choice, Pair, timeframe_str)
+
+def main_training_loop_multiple_pairs():
+    pairs = ['EURUSD', 'GBPUSD', 'USDCHF', 'USDJPY', 'USDCAD', 'AUDUSD', 'XAUUSD', 'AUDCAD', 'NZDUSD', 'GBPCAD']
+    timeframe = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
+
+    choice = '1'  # Assuming '1' is for Forex, as per your original function setup
+
+    for pair in pairs:
+        print(f"Training for {pair} on {timeframe}")
+        training_forex_multiple(choice, pair, timeframe)
 
 def training(choice):
     if choice == '1':
@@ -910,6 +1032,7 @@ def main_menu():
         print("3 - Predict Next- futures")
         print("4 - Predict Next- forex")
         print("5 - Predict Specific Date- forex")
+        print("6 - Train Multiple - forex")
 
         choice = input("Enter your choice (1/2/3): ")
 
@@ -927,6 +1050,9 @@ def main_menu():
             break
         elif choice == '5':
             predict_specific(choice)
+            break
+        elif choice == '6':
+            main_training_loop_multiple_pairs()
             break
         else:
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
