@@ -19,6 +19,7 @@ import json
 import shutil
 import matplotlib.pyplot as plt
 import joblib
+import time
 
 class MLPModel(torch.nn.Module):
     def __init__(self, input_size, hidden_sizes=[100, 50], dropout_rates=[0.2, 0.5], output_size=1):
@@ -392,7 +393,10 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
     # Your existing code
     testing_files = glob.glob('testing*.csv')
     for file in testing_files:
-        testing_set = read_csv_to_dataframe(file)
+        # Reading the CSV with the default settings to preserve the data as is
+        testing_set = pd.read_csv(file)
+        # Set the 'time' column as the DataFrame index
+        testing_set.set_index('time', inplace=True)
 
     testing_set = testing_set.reset_index()
     X_test, y_test = preprocess_data(testing_set)
@@ -446,15 +450,19 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
     cax = ax.matshow(conf_matrix, cmap=plt.cm.Blues)
     fig.colorbar(cax)
 
-    ax.set_xlabel('Predicted labels')
-    ax.set_ylabel('True labels')
-    ax.set_xticklabels([''] + ['Negative', 'Positive'])
-    ax.set_yticklabels([''] + ['Negative', 'Positive'])
+    # Set the ticks first before setting labels
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+
+    ax.set_xticklabels(['Negative', 'Positive'])
+    ax.set_yticklabels(['Negative', 'Positive'])
 
     # Annotate each cell with the numeric value
     for (i, j), val in np.ndenumerate(conf_matrix):
         ax.text(j, i, f'{val}', ha='center', va='center', color='black')
 
+    plt.xlabel('Predicted labels')
+    plt.ylabel('True labels')
     plt.title('Confusion Matrix')
     plt.savefig('confusion_matrix.png')  # Save to the file system of this environment
 
@@ -878,13 +886,53 @@ def training_forex_multiple(choice, Pair, timeframe_str):
 
     evaluate(choice, Pair, timeframe_str)
 
+    backtest_trades_with_dataframe(choice, timeframe_str, Pair)
+
+def fetch_forex_pairs():
+    account_number = 530064788
+    password = 'fe5@6YV*'
+    server_name = 'FTMO-Server3'
+
+    # Initialize MT5 connection
+    if not mt5.initialize():
+        print("initialize() failed, error code =", mt5.last_error())
+        return None
+
+    # Attempt to log in with the given account number, password, and server
+    authorized = mt5.login(account_number, password=password, server=server_name)
+    if not authorized:
+        print("login failed, error code =", mt5.last_error())
+        mt5.shutdown()
+        return None
+    else:
+        print("Connected to MetaTrader 5")
+
+    # Fetch all symbols
+    symbols = mt5.symbols_get()
+
+    # Define a function to check if the symbol name matches the typical Forex pair format
+    def is_forex_pair(name):
+        return len(name) == 6 and name.isalpha()
+
+    # Filter to get only forex pairs, based on the new criteria
+    forex_pairs = [symbol.name for symbol in symbols if is_forex_pair(symbol.name)]
+
+    # Shutdown MT5 connection
+    mt5.shutdown()
+
+    return forex_pairs
+
 def main_training_loop_multiple_pairs():
-    pairs = ['EURUSD', 'GBPUSD', 'USDCHF', 'USDJPY', 'USDCAD', 'AUDUSD', 'XAUUSD', 'AUDCAD', 'NZDUSD', 'GBPCAD']
+    forex_pairs = fetch_forex_pairs()
+    if forex_pairs is None:
+        print("Failed to fetch forex pairs or no forex pairs available.")
+        return
+    
     timeframe = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
 
     choice = '1'  # Assuming '1' is for Forex, as per your original function setup
 
-    for pair in pairs:
+    for pair in forex_pairs:
         print(f"Training for {pair} on {timeframe}")
         training_forex_multiple(choice, pair, timeframe)
 
@@ -1115,7 +1163,7 @@ def backtest_trades_with_dataframe(choice, timeframe_new=None, pair_new=None):
         pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
 
         folder_name = find_recent_forex_agent_dir(pair, timeframe)
-    elif choice == '1' or '2':
+    elif choice == '1' or '2' or '6':
         folder_name = find_recent_forex_agent_dir(pair_new, timeframe_new)
         pair = pair_new
         timeframe = timeframe_new
@@ -1153,12 +1201,12 @@ def backtest_trades_with_dataframe(choice, timeframe_new=None, pair_new=None):
 
     initial_balance=10000
     leverage=30
-    transaction_cost=0.1
+    transaction_cost=0.0002
 
-    if pair == 'USDJPY' or 'AUDJPY' or 'USDJPY' or 'AUDJPY':
-        lot_size=1000
+    if 'JPY' in pair:
+        lot_size = 100  # Smaller lot size for pairs including JPY
     else:
-        lot_size=1000
+        lot_size = 10000  # Default lot size for other pairs
 
     trader = ForexTradingSimulator(
         initial_balance,
@@ -1178,6 +1226,63 @@ def backtest_trades_with_dataframe(choice, timeframe_new=None, pair_new=None):
     data_csv_filename = os.path.join(folder_name, 'data_backtest.csv')
     data.to_csv(data_csv_filename)
 
+def train_magnitude(choice):
+    timeframe = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
+
+    pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
+
+    folder_name = find_recent_forex_agent_dir(pair, timeframe)
+
+    # Define the paths for the CSV files
+    csv_paths = {
+        'training': os.path.join(folder_name, f'training_{pair}_{timeframe}_data.csv'),
+        'testing': os.path.join(folder_name, f'testing_{pair}_{timeframe}_data.csv'),
+        'validation': os.path.join(folder_name, f'validation_{pair}_{timeframe}_data.csv')
+    }
+
+    # Dictionary to store the average normalized_change for each file
+    averages = {}
+
+    # Loop over each CSV file type
+    for file_type, path in csv_paths.items():
+        # Read the CSV file
+        df = pd.read_csv(path)
+        
+        # Convert 'time' column to datetime
+        df['time'] = pd.to_datetime(df['time'])
+        
+        # Reset index (if needed)
+        df = df.reset_index(drop=True)
+        
+        # Drop 'Actual Movement' column, if it exists
+        if 'Actual Movement' in df.columns:
+            df.drop(columns=['Actual Movement'], inplace=True)
+        
+        # Calculate the absolute percentage change in the 'close' price from the previous day
+        df['close_price_percentage_change'] = df['close'].pct_change().abs()
+        
+        # Normalize the percentage change to a scale of 0 to 1
+        df['normalized_change'] = df['close_price_percentage_change'].clip(upper=1)
+        
+        # Calculate the average normalized change
+        average_normalized_change = df['normalized_change'].mean()
+        averages[file_type] = average_normalized_change
+        
+        # Save the modified DataFrame back to CSV
+        output_path = os.path.join(folder_name, f'{file_type}_processed_{pair}_{timeframe}.csv')
+        df.to_csv(output_path, index=False)
+        print(f'Processed {file_type} data saved to {output_path}')
+
+    # Compute the overall average from the stored averages
+    overall_average = sum(averages.values()) / len(averages)
+
+    # Save the averages to a CSV file
+    averages['overall'] = overall_average
+    averages_df = pd.DataFrame(list(averages.items()), columns=['File Type', 'Average Normalized Change'])
+    average_csv_path = os.path.join(folder_name, 'averages_normalized_change.csv')
+    averages_df.to_csv(average_csv_path, index=False)
+    print(f'Averages saved to {average_csv_path}')
+
 def main_menu():
     while True:
         print("\nMain Menu:")
@@ -1188,6 +1293,7 @@ def main_menu():
         print("5 - Predict Specific Date- forex")
         print("6 - Train Multiple - forex")
         print("7 - Backtest - forex")
+        print("8 - Train model with latest data (Magnitude) - forex")
 
         choice = input("Enter your choice (1/2/3): ")
 
@@ -1211,6 +1317,9 @@ def main_menu():
             break
         elif choice == '7':
             backtest_trades_with_dataframe(choice)
+            break
+        elif choice == '8':
+            train_magnitude(choice)
             break
         else:
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
