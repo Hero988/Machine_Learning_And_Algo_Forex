@@ -923,10 +923,14 @@ def fetch_forex_pairs():
     return forex_pairs
 
 def main_training_loop_multiple_pairs():
+    """
     forex_pairs = fetch_forex_pairs()
     if forex_pairs is None:
         print("Failed to fetch forex pairs or no forex pairs available.")
         return
+    """
+
+    forex_pairs = ['EURUSD', 'GBPUSD', 'USDCHF', 'USDJPY', 'USDCAD', 'AUDUSD', 'AUDNZD', 'AUDCAD', 'AUDCHF', 'AUDJPY', 'GBPCAD', 'NZDUSD', 'CHFJPY', 'EURGBP','EURAUD', 'EURCHF', 'EURJPY', 'EURNZD', 'EURCAD', 'GBPCAD', 'GBPCHF', 'GBPJPY', 'CADCHF', 'CADJPY', 'GBPAUD', 'GBPNZD', 'NZDCAD', 'NZDCHF', 'NZDJPY']
     
     timeframe = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
 
@@ -1283,6 +1287,214 @@ def train_magnitude(choice):
     averages_df.to_csv(average_csv_path, index=False)
     print(f'Averages saved to {average_csv_path}')
 
+def fetch_forex_agent_folders():
+    """ Fetch all folder names that start with 'agent_forex' from the current directory. """
+    # Get the current working directory
+    base_dir = os.getcwd()
+
+    # Ensure the base directory exists and is a directory
+    if not os.path.exists(base_dir):
+        raise FileNotFoundError(f"The specified base directory does not exist: {base_dir}")
+    if not os.path.isdir(base_dir):
+        raise NotADirectoryError(f"The specified path is not a directory: {base_dir}")
+
+    # List all items in the base directory
+    dirs = os.listdir(base_dir)
+
+    # Filter out directories that start with 'agent_forex'
+    forex_dirs = [d for d in dirs if d.startswith('agent_forex') and os.path.isdir(os.path.join(base_dir, d))]
+
+    return forex_dirs
+
+def combine_backtest_results():
+    """ Combine backtest results from multiple folders. """
+    folders = fetch_forex_agent_folders()
+    combined_df = pd.DataFrame()
+
+    for folder in folders:
+        file_path = os.path.join(folder, 'trade_history_backtest.csv')
+        if os.path.exists(file_path):
+            df = pd.read_csv(file_path)
+            Pair, timeframe_str = extract_info_from_folder_name(folder)
+            df['Pair'] = Pair  # Assuming folder name contains the pair info at a specific index
+            combined_df = pd.concat([combined_df, df], ignore_index=True)
+
+    return combined_df
+
+def analyze_combined_data(combined_df):
+    """ Perform analysis on the combined DataFrame. """
+    # Convert 'time' column to datetime if not already
+    if combined_df['time'].dtype != 'datetime64[ns]':
+        combined_df['time'] = pd.to_datetime(combined_df['time'])
+
+    # Group by 'time' and calculate sum of 'profit' for each day
+    daily_profit = combined_df.groupby('time')['profit'].sum()
+
+    # Initial settings
+    initial_balance = 10000
+    upper_reset_threshold = 11000
+    lower_reset_threshold = 9000
+    upper_reset_count = 0
+    lower_reset_count = 0
+
+    # Prepare cumulative balance calculation with reset logic
+    balances = [initial_balance]
+    for profit in daily_profit:
+        new_balance = balances[-1] + profit
+        if new_balance >= upper_reset_threshold:
+            balances.append(initial_balance)  # Reset balance to initial when exceeding upper threshold
+            upper_reset_count += 1  # Increment the upper reset counter
+        elif new_balance <= lower_reset_threshold:
+            balances.append(initial_balance)  # Reset balance to initial when dropping below lower threshold
+            lower_reset_count += 1  # Increment the lower reset counter
+        else:
+            balances.append(new_balance)
+
+    # Starting balance
+    initial_balance_graph = 10000
+
+    # Compute cumulative balance by adding the daily profit to the initial balance
+    cumulative_balance = daily_profit.cumsum() + initial_balance_graph
+
+    # Sum of daily profits
+    total_profit = daily_profit.sum()
+    print(f"Total Cumulative Profit: {total_profit}")
+
+    # Calculate the probability of reaching £11,000 before £9,000
+    total_resets = upper_reset_count + lower_reset_count
+    if total_resets > 0:
+        probability_of_upper = (upper_reset_count / total_resets) * 100
+    else:
+        probability_of_upper = 0
+
+    # Print the total number of resets
+    print(f"Total number of upper resets (balance >= {upper_reset_threshold}): {upper_reset_count}")
+    print(f"Total number of lower resets (balance <= {lower_reset_threshold}): {lower_reset_count}")
+
+    print(f"Probability of reaching £11,000 before £9,000: {probability_of_upper:.2f}%")
+
+    # Plotting
+    plt.figure(figsize=(14, 7))
+
+    # Plotting daily profit
+    plt.subplot(1, 2, 1)  # subplot for daily profits
+    plt.plot(daily_profit.index, daily_profit.values, marker='o', linestyle='-', color='blue')
+    plt.title('Daily Profit')
+    plt.xlabel('Date')
+    plt.ylabel('Daily Profit')
+    plt.grid(True)
+    plt.xticks(rotation=45)
+
+    # Plotting cumulative balance with resets
+    plt.subplot(1, 2, 2)  # subplot for cumulative balance
+    plt.plot(cumulative_balance.index, cumulative_balance.values, marker='o', linestyle='-', color='green')
+    plt.title('Cumulative Balance Over Time')
+    plt.xlabel('Date')
+    plt.ylabel('Balance')
+    plt.grid(True)
+    plt.xticks(rotation=45)
+
+    plt.tight_layout()  # Adjust layout to not cut off labels
+    plt.savefig('balance_over_time_combined.png')  # Save the figure
+
+def save_combined_results(combined_df, filename='combined_backtest_results.csv'):
+    """ Save the combined DataFrame to a CSV file in the current directory. """
+    # Define the output path using the current directory and the filename
+    output_path = os.path.join(os.getcwd(), filename)
+
+    # Save the DataFrame to a CSV file
+    combined_df.to_csv(output_path, index=False)
+    print(f"Combined backtest results saved to {output_path}")
+
+def combine_forex_backtest():
+    combined_df = combine_backtest_results()
+    analyze_combined_data(combined_df)
+    save_combined_results(combined_df, 'combined_backtest_results.csv')
+
+def fetch_and_aggregate_results():
+    folders = fetch_forex_agent_folders()
+    combined_df = pd.DataFrame()
+    
+    for folder in folders:
+        file_path = os.path.join(folder, 'trade_history_backtest.csv')
+        if os.path.exists(file_path):
+            df = pd.read_csv(file_path)
+            Pair, timeframe_str = extract_info_from_folder_name(folder)
+            df['Pair'] = Pair
+            df['Timeframe'] = timeframe_str  # Assuming folder names include this info
+            combined_df = pd.concat([combined_df, df], ignore_index=True)
+    
+    return combined_df
+
+def analyze_pair_data(df):
+    """ Analyze data for a single currency pair and return key metrics. """
+    # Make a copy of the DataFrame to avoid SettingWithCopyWarning when modifying data
+    df_copy = df.copy()
+
+    # Ensure 'time' column is in datetime format
+    df_copy['time'] = pd.to_datetime(df_copy['time'])
+
+    # Calculate daily profit
+    daily_profit = df_copy.groupby('time')['profit'].sum()
+
+    # Initial settings for simulation
+    initial_balance = 10000
+    upper_reset_threshold = 11000
+    lower_reset_threshold = 9000
+    upper_reset_count = 0
+    lower_reset_count = 0
+
+    # Calculate cumulative balance with resets
+    balances = [initial_balance]
+    for profit in daily_profit:
+        new_balance = balances[-1] + profit
+        if new_balance >= upper_reset_threshold:
+            balances.append(initial_balance)  # Reset to initial balance
+            upper_reset_count += 1
+        elif new_balance <= lower_reset_threshold:
+            balances.append(initial_balance)  # Reset to initial balance
+            lower_reset_count += 1
+        else:
+            balances.append(new_balance)
+
+    # Calculate the probability of reaching the upper threshold before the lower threshold
+    total_resets = upper_reset_count + lower_reset_count
+    if total_resets > 0:
+        probability_of_upper = (upper_reset_count / total_resets) * 100
+    else:
+        probability_of_upper = 0
+
+    return {
+        'TotalCumulativeProfit': daily_profit.sum(),
+        'ProbabilityOfReachingUpperFirst': probability_of_upper,
+        'PositiveResets': upper_reset_count,
+        'NegativeResets': lower_reset_count
+    }
+
+def compute_probabilities(df):
+    result = []
+    pairs = df['Pair'].unique()
+    
+    for pair in pairs:
+        sub_df = df[df['Pair'] == pair]
+        analysis_results = analyze_pair_data(sub_df)
+        result.append({
+            'Pair': pair,
+            'Probability': analysis_results['ProbabilityOfReachingUpperFirst'],
+            'TotalProfit': analysis_results['TotalCumulativeProfit'],
+            'CountPositiveReset': analysis_results['PositiveResets'],
+            'CountNegativeReset': analysis_results['NegativeResets']
+        })
+    
+    result_df = pd.DataFrame(result)
+    return result_df.sort_values(by='Probability', ascending=False)
+
+def perform_analysis():
+    combined_df = fetch_and_aggregate_results()
+    probability_rankings = compute_probabilities(combined_df)
+    probability_rankings.to_csv('forex_pair_probability_rankings.csv', index=False)
+    print("Analysis complete. Results saved.")
+
 def main_menu():
     while True:
         print("\nMain Menu:")
@@ -1294,6 +1506,8 @@ def main_menu():
         print("6 - Train Multiple - forex")
         print("7 - Backtest - forex")
         print("8 - Train model with latest data (Magnitude) - forex")
+        print("9 - Combine Forex Data and see what is the probability of suceeding (combined) - forex")
+        print("10 - Combine Forex Data and see what is the probability of suceeding (single) - forex")
 
         choice = input("Enter your choice (1/2/3): ")
 
@@ -1320,6 +1534,12 @@ def main_menu():
             break
         elif choice == '8':
             train_magnitude(choice)
+            break
+        elif choice == '9':
+            combine_forex_backtest()
+            break
+        elif choice == '10':
+            perform_analysis()
             break
         else:
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
