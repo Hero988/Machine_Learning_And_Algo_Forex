@@ -492,7 +492,7 @@ def create_sequences(data, sequence_length, labels_data=None):
     else:
         return np.array(sequences)
 
-def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
+def evaluate(choice, Pair='N/A', timeframe_str='N/A', sequence_length=None):
     # Your existing code
     testing_files = glob.glob('testing*.csv')
     for file in testing_files:
@@ -506,8 +506,6 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
     testing_set_features_scaled = scale_data(testing_set)
 
     labels = testing_set['Actual Movement'].values  # Only the labels column
-
-    sequence_length=200
     
     X_test, y_test = create_sequences(testing_set_features_scaled, sequence_length, labels)
     X_test_tensor = torch.FloatTensor(X_test)
@@ -647,7 +645,7 @@ def extract_info_from_folder_name(folder_name):
     else:
         raise ValueError("Folder name format is incorrect or missing essential information.")
 
-def predict_next_forex(choice):
+def predict_next_forex(choice, sequence_length):
     # Retrieve and store the current date
     current_date = str(datetime.now().date())
 
@@ -667,8 +665,6 @@ def predict_next_forex(choice):
     folder_name = find_recent_forex_agent_dir(pair, timeframe)
 
     Pair, timeframe_str = extract_info_from_folder_name(folder_name)
-
-    sequence_length = 10  # Example sequence length
 
     training_start_date = "2000-01-01"
     training_end_date = current_date
@@ -696,7 +692,7 @@ def predict_next_forex(choice):
 
     # Since this is a prediction for the future, we assume no 'Actual Movement' available
     # Prepare data (you need to ensure your preprocessing function can handle single row)
-    X, _ = create_sequences(latest_10_rows_features_scaled, sequence_length=200)
+    X, _ = create_sequences(latest_10_rows_features_scaled, sequence_length)
 
     # Convert to PyTorch tensors
     X_tensor = torch.FloatTensor(X)
@@ -767,7 +763,7 @@ def try_parse_datetime(input_str):
         except ValueError:
             return None, False
 
-def predict_specific(choice):
+def predict_specific(choice, sequence_length):
     # Retrieve and store the current date
     current_date = str(datetime.now().date())
 
@@ -825,8 +821,6 @@ def predict_specific(choice):
         else:
             print("The specified date or datetime is not available in the dataset. Please choose another within the range.")
 
-    sequence_length=200
-
     last_10_rows_up_to_date_features_scaled = scale_data(last_10_rows_up_to_date)
 
     labels = last_10_rows_up_to_date['Actual Movement'].values  # Only the labels column
@@ -861,7 +855,7 @@ def predict_specific(choice):
 
     print(f'Predicted Movement is {predicted_movement}')
 
-def training_forex_multiple(choice, Pair, timeframe_str):
+def training_forex_multiple(choice, Pair, timeframe_str, sequence_length):
     current_date = str(datetime.now().date())
     strategy_start_date_all = "1971-01-04"
     strategy_end_date_all = current_date
@@ -892,8 +886,6 @@ def training_forex_multiple(choice, Pair, timeframe_str):
 
     labels_testing = testing_set['Actual Movement'].values  # Only the labels column
     labels_training = training_set['Actual Movement'].values  # Only the labels column
-
-    sequence_length=200
 
     input_dim = testing_set_features_scaled.shape[1]  # Number of columns in the DataFrame
 
@@ -972,9 +964,9 @@ def training_forex_multiple(choice, Pair, timeframe_str):
 
     print("Training completed. Best model saved as 'lstm_model.pth'.")
 
-    evaluate(choice, Pair, timeframe_str)
+    evaluate(choice, Pair, timeframe_str, sequence_length)
 
-    backtest_trades_with_dataframe(choice, timeframe_str, Pair)
+    backtest_trades_with_dataframe(choice, timeframe_str, Pair, sequence_length)
 
 def fetch_forex_pairs():
     account_number = 530064788
@@ -1010,7 +1002,7 @@ def fetch_forex_pairs():
 
     return forex_pairs
 
-def main_training_loop_multiple_pairs():
+def main_training_loop_multiple_pairs(sequence_length):
     """
     forex_pairs = fetch_forex_pairs()
     if forex_pairs is None:
@@ -1026,9 +1018,9 @@ def main_training_loop_multiple_pairs():
 
     for pair in forex_pairs:
         print(f"Training for {pair} on {timeframe}")
-        training_forex_multiple(choice, pair, timeframe)
+        training_forex_multiple(choice, pair, timeframe, sequence_length)
 
-def training(choice):
+def training(choice, sequence_length):
     if choice == '1':
         # Retrieve and store the current date
         current_date = str(datetime.now().date())
@@ -1094,12 +1086,6 @@ def training(choice):
     labels_testing = testing_set['Actual Movement'].values  # Only the labels column
     labels_training = training_set['Actual Movement'].values  # Only the labels column
 
-    """
-    For intraday trading: 10-50 timesteps might be sufficient.
-    For daily trading: 20-100 timesteps can be a good start, allowing the model to learn from about one to three months of data.
-    """
-    sequence_length=200
-
     input_dim = testing_set_features_scaled.shape[1]  # Number of columns in the DataFrame
 
     X_train, y_train = create_sequences(training_set_features_scaled, sequence_length, labels_training)
@@ -1118,7 +1104,6 @@ def training(choice):
     train_loader = DataLoader(train_dataset, batch_size=batch_size)
     val_loader = DataLoader(test_dataset, batch_size=batch_size)
 
-    sequence_length = 10  # Example sequence length
     input_dim = training_set_features_scaled.shape[1]  # Number of columns in the DataFrame
 
     model = LSTMModel(input_dim=input_dim, hidden_dim=50, layer_dim=1, output_dim=1)
@@ -1180,7 +1165,7 @@ def training(choice):
 
     print("Training completed. Best model saved as 'lstm_model.pth'.")
 
-    evaluate(choice, Pair, timeframe_str)
+    evaluate(choice, Pair, timeframe_str, sequence_length)
 
     backtest_trades_with_dataframe(choice, timeframe_str, Pair)
 
@@ -1616,19 +1601,21 @@ def main_menu():
 
         choice = input("Enter your choice (1/2/3): ")
 
+        sequence_length=14
+
         if choice == '1':
-            training(choice)
+            training(choice, sequence_length)
             break
         elif choice == '2':
-            training(choice)
+            training(choice, sequence_length)
         elif choice == '4':
-            predict_next_forex(choice)
+            predict_next_forex(choice, sequence_length)
             break
         elif choice == '5':
-            predict_specific(choice)
+            predict_specific(choice, sequence_length)
             break
         elif choice == '6':
-            main_training_loop_multiple_pairs()
+            main_training_loop_multiple_pairs(sequence_length)
             break
         elif choice == '7':
             backtest_trades_with_dataframe(choice)
