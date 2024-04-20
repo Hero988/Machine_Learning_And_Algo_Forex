@@ -202,10 +202,18 @@ def calculate_indicators(data, choice):
     data['Stoch_%K'] = stoch['STOCHk_14_3_3']
     data['Stoch_%D'] = stoch['STOCHd_14_3_3']
 
-    data['close_price_previous'] = data['close'].shift(1).fillna(0)
+    # Shift the 'close' column up to get the next 'close' price in the future
+    data['close_price_next'] = data['close'].shift(-1)
+
+    # Calculate the 'Actual Movement' based on the future price movement
+    data['Actual Movement'] = np.where(data['close_price_next'] > data['close'], 1,
+                                       np.where(data['close_price_next'] < data['close'], -1, 0))
+
+    # Drop the 'close_price_next' column if you no longer need it
+    data.drop(columns=['close_price_next'], inplace=True)
+
     data['close_price_percentage_change'] = data['close'].pct_change().fillna(0) * 100
     data['close_price_previous_percentage_change'] = data['close_price_percentage_change'].shift(1).fillna(0)
-    data['Actual Movement'] = np.where(data['close'] > data['close_price_previous'], 1, np.where(data['close'] < data['close_price_previous'], -1, 0))
 
     if choice == '1':
         # Remove the last row of the DataFrame
@@ -226,8 +234,15 @@ def calculate_movement(data):
 
     data['close_price_percentage_change'] = data['close'].pct_change().fillna(0) * 100
     data['close_price_previous_percentage_change'] = data['close_price_percentage_change'].shift(1).fillna(0)
-    data['close_price_previous'] = data['close'].shift(1).fillna(0)
-    data['Actual Movement'] = np.where(data['close'] > data['close_price_previous'], 1, np.where(data['close'] < data['close_price_previous'], -1, 0))
+    # Shift the 'close' column up to get the next 'close' price in the future
+    data['close_price_next'] = data['close'].shift(-1)
+
+    # Calculate the 'Actual Movement' based on the future price movement
+    data['Actual Movement'] = np.where(data['close_price_next'] > data['close'], 1,
+                                       np.where(data['close_price_next'] < data['close'], -1, 0))
+
+    # Drop the 'close_price_next' column if you no longer need it
+    data.drop(columns=['close_price_next'], inplace=True)
 
     # Return the data with added indicators
     return data
@@ -425,7 +440,7 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
     adjusted_predictions = np.where(final_predictions == 0, -1, 1)
     adjusted_true_labels = np.where(true_labels == 0, -1, 1)
 
-    results_df = testing_set[['time', 'Actual Movement']].reset_index(drop=True)
+    results_df = testing_set[['time', 'Actual Movement', 'close']].reset_index(drop=True)
     results_df['Predictions'] = predictions
     results_df['Predicted'] = adjusted_predictions
 
@@ -1189,16 +1204,16 @@ def backtest_trades_with_dataframe(choice, timeframe_new=None, pair_new=None):
     data.drop(columns=['time_x'], inplace=True)
     data.rename(columns={'time_y': 'time'}, inplace=True)
 
-    data = data.reset_index()
+    data.rename(columns={'close_x': 'close'}, inplace=True)
 
     # Convert time column to datetime if not already
     data['time'] = pd.to_datetime(data['time'])
     data = data.sort_values('time')  # Ensure data is sorted by time
 
-    data['previous close price'] = data['close'].shift(1)
+    data['close_price_next'] = data['close'].shift(-1)
 
     # Define the columns to keep
-    columns_to_keep = ['time', 'Actual Movement', 'Predictions', 'Predicted', 'close', 'previous close price']
+    columns_to_keep = ['time', 'Actual Movement', 'Predictions', 'Predicted', 'close', 'close_price_next']
 
     # Select these columns in the DataFrame
     data = data[columns_to_keep]
