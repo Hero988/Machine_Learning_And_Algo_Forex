@@ -1024,6 +1024,160 @@ def training(choice):
 
     evaluate(choice, Pair, timeframe_str)
 
+    backtest_trades_with_dataframe(choice, timeframe_str, Pair)
+
+class ForexTradingSimulator:
+    def __init__(self, initial_balance, leverage, transaction_cost, lot_size):
+        self.current_balance = initial_balance
+        self.leverage = leverage
+        self.transaction_cost = transaction_cost
+        self.lot_size = lot_size
+        self.trade_history = []
+        self.position = 'neutral'
+        self.entry_price = None
+        self.is_open_position = False
+
+    def open_position(self, current_price, position_type, time):
+        if not self.is_open_position:
+            cost = self.transaction_cost
+            self.current_balance -= cost  # Transaction cost
+            self.entry_price = current_price
+            self.position = position_type
+            self.is_open_position = True
+
+            # Log the trade
+            self.log_trade('open', current_price, time)
+
+    def close_position(self, current_price, time):
+        if self.is_open_position:
+            if self.position == 'long':
+                profit = (current_price - self.entry_price) * self.lot_size
+            elif self.position == 'short':
+                profit = (self.entry_price - current_price) * self.lot_size
+
+            self.current_balance += profit - self.transaction_cost
+            self.is_open_position = False
+            self.position = 'neutral'
+
+            # Log the trade
+            self.log_trade('close', current_price, time , profit)
+
+    def log_trade(self, action, price, time, profit=None):
+        self.trade_history.append({
+            'time': time,
+            'action': action,
+            'position': self.position,
+            'entry_price': self.entry_price if action == 'open' else None,
+            'close_price': price if action == 'close' else None,
+            'profit': profit,
+            'balance': self.current_balance
+        })
+
+    def simulate_trading(self, data):
+        for _, row in data.iterrows():
+            # Check if there is a change in predicted movement
+            if row['Predicted'] == 1:
+                if not self.is_open_position or self.position == 'short':
+                    if self.is_open_position:  # Close the current short position before opening a new long position
+                        self.close_position(row['close'], row['time'])
+                    self.open_position(row['close'], 'long', row['time'])
+            elif row['Predicted'] == -1:
+                if not self.is_open_position or self.position == 'long':
+                    if self.is_open_position:  # Close the current long position before opening a new short position
+                        self.close_position(row['close'], row['time'])
+                    self.open_position(row['close'], 'short', row['time'])
+
+        # Optionally, close any open position at the end of the data
+        if self.is_open_position:
+            self.close_position(data.iloc[-1]['close'], data.iloc[-1]['time'])
+
+    def plot_balance_over_time(self, folder_name):
+        # Create a DataFrame from the trade history
+        trades = pd.DataFrame(self.trade_history)
+        trades.set_index('time', inplace=True)  # Set time as the index
+
+        # Plotting
+        plt.figure(figsize=(10, 5))
+        trades['balance'].plot(title='Balance Over Time', color='blue', marker='o')
+        plt.xlabel('Time')
+        plt.ylabel('Balance ($)')
+        plt.grid(True)
+        # Save the plot as a PNG file
+        plot_path = os.path.join(folder_name, 'balance_over_time_backtest.png')
+        plt.savefig(plot_path)
+        plt.close()  # Close the plot figure to free up memory
+
+def backtest_trades_with_dataframe(choice, timeframe_new=None, pair_new=None):
+
+    if choice == '7':
+        timeframe = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
+
+        pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
+
+        folder_name = find_recent_forex_agent_dir(pair, timeframe)
+    elif choice == '1' or '2':
+        folder_name = find_recent_forex_agent_dir(pair_new, timeframe_new)
+        pair = pair_new
+        timeframe = timeframe_new
+
+    # Construct the path to the model file within the specified folder
+    predicted_movement_path = os.path.join(folder_name, 'predicted_classification_with_Actual_Movement_and_close_MLP.csv')
+
+    predictions_df = pd.read_csv(predicted_movement_path)
+
+    main_df = os.path.join(folder_name, f'testing_{pair}_{timeframe}_data.csv')
+
+    prices_df = pd.read_csv(main_df)  
+
+    data = predictions_df.merge(prices_df, left_index=True, right_index=True, how='left')
+
+    data.drop(columns=['Actual Movement_y'], inplace=True)
+    data.rename(columns={'Actual Movement_x': 'Actual Movement'}, inplace=True)
+
+    data.drop(columns=['time_x'], inplace=True)
+    data.rename(columns={'time_y': 'time'}, inplace=True)
+
+    data = data.reset_index()
+
+    # Convert time column to datetime if not already
+    data['time'] = pd.to_datetime(data['time'])
+    data = data.sort_values('time')  # Ensure data is sorted by time
+
+    data['previous close price'] = data['close'].shift(1)
+
+    # Define the columns to keep
+    columns_to_keep = ['time', 'Actual Movement', 'Predictions', 'Predicted', 'close', 'previous close price']
+
+    # Select these columns in the DataFrame
+    data = data[columns_to_keep]
+
+    initial_balance=10000
+    leverage=30
+    transaction_cost=0.1
+
+    if pair == 'USDJPY' or 'AUDJPY' or 'USDJPY' or 'AUDJPY':
+        lot_size=1000
+    else:
+        lot_size=1000
+
+    trader = ForexTradingSimulator(
+        initial_balance,
+        leverage,
+        transaction_cost,
+        lot_size,
+    )
+    trader.simulate_trading(data)
+
+    trader.plot_balance_over_time(folder_name)
+
+    trade_history_df = pd.DataFrame(trader.trade_history)
+
+    trade_history_filename = os.path.join(folder_name, 'trade_history_backtest.csv')
+    trade_history_df.to_csv(trade_history_filename)
+
+    data_csv_filename = os.path.join(folder_name, 'data_backtest.csv')
+    data.to_csv(data_csv_filename)
+
 def main_menu():
     while True:
         print("\nMain Menu:")
@@ -1033,6 +1187,7 @@ def main_menu():
         print("4 - Predict Next- forex")
         print("5 - Predict Specific Date- forex")
         print("6 - Train Multiple - forex")
+        print("7 - Backtest - forex")
 
         choice = input("Enter your choice (1/2/3): ")
 
@@ -1053,6 +1208,9 @@ def main_menu():
             break
         elif choice == '6':
             main_training_loop_multiple_pairs()
+            break
+        elif choice == '7':
+            backtest_trades_with_dataframe(choice)
             break
         else:
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
