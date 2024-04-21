@@ -47,64 +47,6 @@ class RNNModel(nn.Module):
         # Reshape the data for feed into Fully connected layer
         out = self.fc(out[:, -1, :])  # take the last sequence output
         return torch.sigmoid(out)
-
-class AttentionModule(nn.Module):
-    def __init__(self, input_dim):
-        super(AttentionModule, self).__init__()
-        self.attention = nn.Linear(input_dim, 1)
-
-    def forward(self, x):
-        # x shape: (batch, seq_len, features)
-        scores = self.attention(x)  # Shape: (batch, seq_len, 1)
-        weights = F.softmax(scores, dim=1)
-        weighted = torch.mul(x, weights)
-        return weighted.sum(dim=1)  # Sum over the sequence dimension
-
-class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim=150, layer_dim=3, output_dim=1, bidirectional=True, dropout_rate=0.5):
-        super(LSTMModel, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.layer_dim = layer_dim  # ensure this is properly defined
-        
-        # Bidirectional LSTM Layer with dropout
-        self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim, batch_first=True, 
-                            bidirectional=bidirectional, dropout=dropout_rate if layer_dim > 1 else 0)
-        
-        # Attention Module
-        self.attention = AttentionModule(hidden_dim * 2 if bidirectional else hidden_dim)
-        
-        # Fully connected layers with dropout
-        self.fc1 = nn.Linear(hidden_dim * 2 if bidirectional else hidden_dim, hidden_dim * 4)
-        self.dropout1 = nn.Dropout(dropout_rate)
-        self.fc2 = nn.Linear(hidden_dim * 4, hidden_dim * 2)
-        self.dropout2 = nn.Dropout(dropout_rate)
-        self.fc3 = nn.Linear(hidden_dim * 2, output_dim)
-
-    def forward(self, x):
-        # Initialize hidden and cell states
-        h0, c0 = self.init_hidden(x)
-        
-        # Forward propagate LSTM
-        lstm_out, _ = self.lstm(x, (h0, c0))
-        
-        # Apply attention
-        attention_out = self.attention(lstm_out)
-        
-        # Passing through the fully connected layers
-        x = self.fc1(attention_out)
-        x = F.relu(self.dropout1(x))
-        x = self.fc2(x)
-        x = F.relu(self.dropout2(x))
-        x = self.fc3(x)
-        
-        return torch.sigmoid(x)
-
-    def init_hidden(self, x):
-        batch_size = x.size(0)
-        num_directions = 2 if self.lstm.bidirectional else 1
-        h0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim).to(x.device)
-        c0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim).to(x.device)
-        return h0, c0
     
 def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
 
@@ -200,22 +142,6 @@ def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
     
     # Return the prepared DataFrame containing the rates
     return rates_frame
-
-def get_user_date_input(prompt):
-    # Specify the expected date format
-    date_format = '%Y-%m-%d'
-    # Prompt the user for a date
-    date_str = input(prompt)
-    # Loop until a valid date format is entered
-    while True:
-        try:
-            # Attempt to parse the date; if successful, it's valid, so return it
-            pd.to_datetime(date_str, format=date_format)
-            return date_str
-        except ValueError:
-            # If parsing fails, notify the user and prompt again
-            print("The date format is incorrect. Please enter the date in 'YYYY-MM-DD' format.")
-            date_str = input(prompt)
 
 def calculate_indicators(data, choice):
     bollinger_length=12
@@ -540,8 +466,8 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A', sequence_length=None):
     # Assuming the sequence length and input dimension are defined
     input_dim = testing_set_features_scaled.shape[1]  # Number of columns in the DataFrame
 
-    model = LSTMModel(input_dim=input_dim)
-    model.load_state_dict(torch.load('lstm_model.pth'))  # Ensure you have trained and saved the RNN model
+    model = RNNModel(input_dim=input_dim)
+    model.load_state_dict(torch.load('RNN_model.pth'))  # Ensure you have trained and saved the RNN model
     model.eval()
 
     predictions, true_labels = [], []
@@ -602,7 +528,7 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A', sequence_length=None):
     plt.savefig('confusion_matrix.png')  # Save to the file system of this environment
 
     # Save all files except the specified ones
-    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'RNN_LSTM.py']
+    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'RFT.py']
     for file in os.listdir('.'):
         if file not in exclude_files and os.path.isfile(file):
             shutil.move(file, os.path.join(save_directory, file))
@@ -613,7 +539,7 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A', sequence_length=None):
 
 def get_model_path(folder_name):
     # Construct the path to the model file within the specified folder
-    model_path = os.path.join(folder_name, 'lstm_model.pth')
+    model_path = os.path.join(folder_name, 'RNN_model.pth')
 
     print(model_path)
     
@@ -723,7 +649,7 @@ def predict_next_forex(choice, sequence_length):
     input_dim = latest_10_rows_features_scaled.shape[1]  # Number of columns in the DataFrame
 
     # Load the model (ensure it's already trained and the state dict is available)
-    model = LSTMModel(input_dim=input_dim)
+    model = RNNModel(input_dim=input_dim)
     model_path = get_model_path(folder_name)
     model.load_state_dict(torch.load(model_path))
     model.eval()
@@ -856,7 +782,7 @@ def predict_specific(choice, sequence_length):
     input_dim = last_10_rows_up_to_date_features_scaled.shape[1]  # Number of columns in the DataFrame
 
     # Load the model (ensure it's already trained and the state dict is available)
-    model = LSTMModel(input_dim=input_dim)
+    model = RNNModel(input_dim=input_dim)
     model_path = get_model_path(folder_name)
     model.load_state_dict(torch.load(model_path))
     model.eval()
@@ -928,9 +854,9 @@ def training_forex_multiple(choice, Pair, timeframe_str, sequence_length):
     train_loader = DataLoader(train_dataset, batch_size=batch_size)
     val_loader = DataLoader(test_dataset, batch_size=batch_size)
 
-    model = LSTMModel(input_dim=input_dim)
+    model = RNNModel(input_dim=input_dim)
     loss_function = BCELoss()
-    optimizer = Adam(model.parameters(), lr=0.001)
+    optimizer = Adam(model.parameters(), lr=0.001, weight_decay=0.01)  # Adding weight decay for L2 regularization
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
 
     epochs = 100  # Adjust number of epochs based on your dataset and early stopping criteria
@@ -976,7 +902,7 @@ def training_forex_multiple(choice, Pair, timeframe_str, sequence_length):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             no_improvement_count = 0
-            torch.save(model.state_dict(), 'lstm_model.pth')
+            torch.save(model.state_dict(), 'RNN_model.pth')
             print("Validation loss decreased, saving model...")
         else:
             no_improvement_count += 1
@@ -985,7 +911,7 @@ def training_forex_multiple(choice, Pair, timeframe_str, sequence_length):
                 print("Early stopping triggered")
                 break
 
-    print("Training completed. Best model saved as 'lstm_model.pth'.")
+    print("Training completed. Best model saved as 'RNN_model.pth'.")
 
     evaluate(choice, Pair, timeframe_str, sequence_length)
 
@@ -1129,9 +1055,9 @@ def training(choice, sequence_length):
 
     input_dim = training_set_features_scaled.shape[1]  # Number of columns in the DataFrame
 
-    model = LSTMModel(input_dim=input_dim)
+    model = RNNModel(input_dim=input_dim)
     loss_function = BCELoss()
-    optimizer = Adam(model.parameters(), lr=0.001)
+    optimizer = Adam(model.parameters(), lr=0.001, weight_decay=0.01)  # Adding weight decay for L2 regularization
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
 
     epochs = 100  # Adjust number of epochs based on your dataset and early stopping criteria
@@ -1177,7 +1103,7 @@ def training(choice, sequence_length):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             no_improvement_count = 0
-            torch.save(model.state_dict(), 'lstm_model.pth')
+            torch.save(model.state_dict(), 'RNN_model.pth')
             print("Validation loss decreased, saving model...")
         else:
             no_improvement_count += 1
@@ -1186,7 +1112,7 @@ def training(choice, sequence_length):
                 print("Early stopping triggered")
                 break
 
-    print("Training completed. Best model saved as 'lstm_model.pth'.")
+    print("Training completed. Best model saved as 'RNN_model.pth'.")
 
     evaluate(choice, Pair, timeframe_str, sequence_length)
 

@@ -15,6 +15,7 @@ from sklearn.preprocessing import MinMaxScaler
 from torch.nn import BCELoss
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.ensemble import RandomForestClassifier
 import json
 import shutil
 import matplotlib.pyplot as plt
@@ -1509,6 +1510,78 @@ def perform_analysis():
     probability_rankings.to_csv('forex_pair_probability_rankings.csv', index=False)
     print("Analysis complete. Results saved.")
 
+# Function to prepare, train RandomForest and find the optimal threshold
+def prepare_and_train_random_forest(choice):
+    # Retrieve and store the current date
+    current_date = str(datetime.now().date())
+
+    # Hardcoded start date for strategy evaluation
+    strategy_start_date_all = "1971-01-04"
+    # Use the current date as the end date for strategy evaluation
+    strategy_end_date_all = current_date
+
+    # Convert string representation of dates to datetime objects for further processing
+    start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
+    end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
+
+    # Prompt the user to decide if they want real-time data updates and store the boolean result
+    #enable_real_time = input("Do you want to enable real-time data updates? (yes/no): ").lower().strip() == 'yes'
+
+    # Prompt the user for the desired timeframe for analysis and standardize the input
+    timeframe_str = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
+    # Prompt the user for the currency pair they're interested in and standardize the input
+    Pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
+
+    training_start_date = "2000-01-01"
+    training_end_date = current_date
+
+    # Fetch and prepare the FX data for the specified currency pair and timeframe
+    eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
+
+    # Apply technical indicators to the data using the 'calculate_indicators' function
+    eur_usd_data = calculate_indicators(eur_usd_data, choice)
+
+    # Filter the EUR/USD data for the in-sample training period
+    dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
+
+    # Drop rows where any of the data is missing
+    dataset = dataset.dropna()
+
+    # Split the data
+    training_set, validation_set = split_and_save_dataset(dataset, timeframe_str, Pair)
+
+    # Feature selection
+    features = [col for col in training_set.columns if col != 'Actual Movement']
+    X_train = training_set[features]
+    y_train = training_set['Actual Movement']
+    X_validation = validation_set[features]
+    y_validation = validation_set['Actual Movement']
+
+    # Initialize and train RandomForest with probability prediction
+    rf_classifier = RandomForestClassifier(n_estimators=100, random_state=42, min_samples_split=10)
+    rf_classifier.fit(X_train, y_train)
+
+    # Predict probabilities on the validation set
+    y_probs = rf_classifier.predict_proba(X_validation)[:, 1]  # Probability of class 1
+
+    # Find the optimal threshold from probabilities
+    optimal_threshold = find_optimal_threshold_accuracy(y_validation, y_probs)
+
+    # Save the optimal threshold to JSON
+    save_optimal_threshold_json(optimal_threshold)
+
+    # Use the optimal threshold to make final predictions
+    y_pred = (y_probs >= optimal_threshold).astype(int)
+    final_accuracy = accuracy_score(y_validation, y_pred)
+
+    results_df = validation_set[['time', 'Actual Movement', 'close']].reset_index(drop=True)
+    results_df['Predictions'] = y_probs
+    results_df['Predicted'] = y_pred
+
+    results_df.to_csv('predicted_classification_with_Actual_Movement_and_close_MLP.csv', index=False)
+    
+    print(f"Final accuracy using optimal threshold: {final_accuracy:.2%}")
+
 def main_menu():
     while True:
         print("\nMain Menu:")
@@ -1522,6 +1595,7 @@ def main_menu():
         print("8 - Train model with latest data (Magnitude) - forex")
         print("9 - Combine Forex Data and see what is the probability of suceeding (combined) - forex")
         print("10 - Combine Forex Data and see what is the probability of suceeding (single) - forex")
+        print("11 - RFT - forex")
 
         choice = input("Enter your choice (1/2/3): ")
 
@@ -1554,6 +1628,9 @@ def main_menu():
             break
         elif choice == '10':
             perform_analysis()
+            break
+        elif choice == '11':
+            prepare_and_train_random_forest(choice)
             break
         else:
             print("Invalid choice. Please enter 1, 2, 3, or 4.")

@@ -10,42 +10,76 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_curve, f1_score
 from sklearn.preprocessing import MinMaxScaler
 from torch.nn import BCELoss
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import json
 import shutil
+import torch.nn as nn
 import matplotlib.pyplot as plt
 import joblib
-import torch.nn as nn
 import torch.nn.functional as F
 
-class MLPModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[100, 75, 50, 25], dropout_rates=[0.2, 0.3, 0.4, 0.5], output_size=1):
-        super(MLPModel, self).__init__()
-        # Initialize layers dynamically
-        self.layers = nn.ModuleList()
-        # Construct the hidden layers
-        layer_sizes = [input_size] + hidden_sizes
-        for i in range(len(hidden_sizes)):
-            self.layers.append(nn.Linear(layer_sizes[i], layer_sizes[i+1]))
-            self.layers.append(nn.ReLU())  # Consider using other activations like nn.LeakyReLU() or nn.ELU()
-            self.layers.append(nn.Dropout(dropout_rates[i]))
-        
-        # Output layer
-        self.output_layer = nn.Sequential(
-            nn.Linear(hidden_sizes[-1], output_size),
-            nn.Sigmoid()
-        )
+class AttentionModule(nn.Module):
+    def __init__(self, input_dim):
+        super(AttentionModule, self).__init__()
+        self.attention = nn.Linear(input_dim, 1)
 
     def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        x = self.output_layer(x)
-        return x
+        # x shape: (batch, seq_len, features)
+        scores = self.attention(x)  # Shape: (batch, seq_len, 1)
+        weights = F.softmax(scores, dim=1)
+        weighted = torch.mul(x, weights)
+        return weighted.sum(dim=1)  # Sum over the sequence dimension
 
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=150, layer_dim=3, output_dim=1, bidirectional=True, dropout_rate=0.5):
+        super(LSTMModel, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.layer_dim = layer_dim
+        
+        # Bidirectional LSTM Layer with dropout
+        self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim, batch_first=True, 
+                            bidirectional=bidirectional, dropout=dropout_rate if layer_dim > 1 else 0)
+        
+        # Attention Module
+        self.attention = AttentionModule(hidden_dim * 2 if bidirectional else hidden_dim)
+        
+        # Fully connected layers with dropout
+        self.fc1 = nn.Linear(hidden_dim * 2 if bidirectional else hidden_dim, hidden_dim * 4)
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(hidden_dim * 4, hidden_dim * 2)
+        self.dropout2 = nn.Dropout(dropout_rate)
+        self.fc3 = nn.Linear(hidden_dim * 2, output_dim)
+
+    def forward(self, x):
+        # Initialize hidden and cell states
+        h0, c0 = self.init_hidden(x)
+        
+        # Forward propagate LSTM
+        lstm_out, _ = self.lstm(x, (h0, c0))
+        
+        # Apply attention
+        attention_out = self.attention(lstm_out)
+        
+        # Passing through the fully connected layers
+        x = self.fc1(attention_out)
+        x = F.relu(self.dropout1(x))
+        x = self.fc2(x)
+        x = F.relu(self.dropout2(x))
+        x = self.fc3(x)
+        
+        return torch.sigmoid(x)
+
+    def init_hidden(self, x):
+        batch_size = x.size(0)
+        num_directions = 2 if self.lstm.bidirectional else 1
+        h0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim).to(x.device)
+        c0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim).to(x.device)
+        return h0, c0
+    
 def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
 
     # Define your MetaTrader 5 account number
@@ -194,25 +228,26 @@ def calculate_indicators(data, choice):
     data['Stoch_%K'] = stoch['STOCHk_14_3_3']
     data['Stoch_%D'] = stoch['STOCHd_14_3_3']
 
+    data['close_price_previous'] = data['close'].shift(1)
+    
+    data['close_price_percentage_change'] = data['close'].pct_change() * 100
+    data['close_price_previous_percentage_change'] = data['close_price_percentage_change'].shift(1)
+    
+    # Time-based features
+    data['day_of_week'] = data.index.dayofweek
+    data['month_of_year'] = data.index.month
+
     # Shift the 'close' column up to get the next 'close' price in the future
     data['close_price_next'] = data['close'].shift(-1)
-
-    data['close_price_previous'] = data['close'].shift(1)
 
     # Calculate the 'Actual Movement' based on the future price movement
     data['Actual Movement'] = np.where(data['close_price_next'] > data['close'], 1,
                                        np.where(data['close_price_next'] < data['close'], -1, 0))
+    
+    data['Actual Movement Previous'] = data['Actual Movement'].shift(1)
 
     # Drop the 'close_price_next' column if you no longer need it
     data.drop(columns=['close_price_next'], inplace=True)
-
-    data['close_price_percentage_change'] = data['close'].pct_change().fillna(0) * 100
-    data['previous_close_price_percentage_change'] = data['close_price_percentage_change'].shift(1)
-
-    data['Actual Movement Previous'] = data['Actual Movement'].shift(1)
-
-    data['day_of_week'] = data.index.dayofweek
-    data['month_of_year'] = data.index.month
 
     if choice == '1':
         # Remove the last row of the DataFrame
@@ -231,8 +266,8 @@ def calculate_movement(data):
         # Rename the column
         data.rename(columns={'Close': 'close'}, inplace=True)
 
-    data['close_price_percentage_change'] = data['close'].pct_change().fillna(0) * 100
-    data['close_price_previous_percentage_change'] = data['close_price_percentage_change'].shift(1).fillna(0)
+    data['close_price_percentage_change'] = data['close'].pct_change() * 100
+    data['close_price_previous_percentage_change'] = data['close_price_percentage_change'].shift(1)
     # Shift the 'close' column up to get the next 'close' price in the future
     data['close_price_next'] = data['close'].shift(-1)
 
@@ -332,35 +367,29 @@ def read_csv_to_dataframe(file_path):
 
     return df
 
-def preprocess_data(data, scaler_path='scaler.pkl'):
-    # Load the pre-fitted scaler
-    scaler = joblib.load(scaler_path)
-    
-    # Assuming 'time' and 'Actual Movement' are non-numeric columns we want to drop for training
+def scale_data(data, scaler=None, scaler_path=None):
+    if scaler == None:
+        if scaler_path == None:
+            scaler_path='scaler.pkl'
+            scaler = joblib.load(scaler_path)
+        else:
+            scaler = joblib.load(scaler_path)
+
     data_numeric = data.drop(columns=['time', 'Actual Movement']).values
-    
     # Transform the data using the loaded scaler
     data_scaled = scaler.transform(data_numeric)
-    
-    # Prepare labels if 'Actual Movement' exists in the data
-    if 'Actual Movement' in data.columns:
-        labels = np.where(data['Actual Movement'].values == -1, 0, 1)
-        return data_scaled, labels
-    
     return data_scaled
 
-def fit_and_save_scaler(data):
-    # Drop non-numeric or target columns
-    data_numeric = data.drop(columns=['time', 'Actual Movement']).values
-    
-    # Initialize the scaler
+def fit_and_save_scaler(data, scaler_path='scaler.pkl'):
     scaler = MinMaxScaler()
+    # Assuming 'time' and 'Actual Movement' are non-numeric columns we want to drop for training
+    data_numeric = data.drop(columns=['time', 'Actual Movement']).values
     
     # Fit the scaler on the data
     scaler.fit(data_numeric)
     
     # Save the scaler for later use
-    joblib.dump(scaler, 'scaler.pkl')
+    joblib.dump(scaler, scaler_path)
 
 def find_optimal_threshold_accuracy(y_true, y_probs):
     # Define a range of possible thresholds from 0 to 1 with a small step
@@ -403,7 +432,31 @@ def load_optimal_threshold_json(model_path):
         data = json.load(f)
         return data['optimal_threshold']
 
-def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
+def create_sequences(data, sequence_length, labels_data=None):
+    sequences = []
+    labels = []
+    for i in range(len(data) - sequence_length):
+        seq = data[i:i + sequence_length]
+        seq = np.asarray(seq, dtype=np.float32)  # Ensure sequence is in the correct data type
+        sequences.append(seq)
+        
+        # Handle labels if labels_data is provided
+        if labels_data is not None:
+            # We assume that labels_data is a numeric array of the same length as data
+            # and that the labels are directly based on the values following the sequences
+            if i + sequence_length < len(labels_data):
+                # Convert labels from -1, 1 to 0, 1
+                label = (labels_data[i + sequence_length] + 1) // 2
+            else:
+                label = 0  # Default label for any out-of-range issues
+            labels.append(label)
+
+    if labels_data is not None:
+        return np.array(sequences), np.array(labels)
+    else:
+        return np.array(sequences)
+
+def evaluate(choice, Pair='N/A', timeframe_str='N/A', sequence_length=None):
     # Your existing code
     testing_files = glob.glob('testing*.csv')
     for file in testing_files:
@@ -413,22 +466,30 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
         testing_set.set_index('time', inplace=True)
 
     testing_set = testing_set.reset_index()
-    X_test, y_test = preprocess_data(testing_set)
+
+    testing_set_features_scaled = scale_data(testing_set)
+
+    labels = testing_set['Actual Movement'].values  # Only the labels column
+    
+    X_test, y_test = create_sequences(testing_set_features_scaled, sequence_length, labels)
     X_test_tensor = torch.FloatTensor(X_test)
     y_test_tensor = torch.FloatTensor(y_test).unsqueeze(1)  # Adjust shape for BCELoss compatibility
 
     test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
     test_loader = DataLoader(test_dataset, batch_size=16)
+    
+    # Assuming the sequence length and input dimension are defined
+    input_dim = testing_set_features_scaled.shape[1]  # Number of columns in the DataFrame
 
-    model = MLPModel(input_size=X_test.shape[1])
-    model.load_state_dict(torch.load('mlp_model.pth'))
+    model = LSTMModel(input_dim=input_dim)
+    model.load_state_dict(torch.load('lstm_model.pth'))  # Ensure you have trained and saved the RNN model
     model.eval()
 
     predictions, true_labels = [], []
     with torch.no_grad():
-        for inputs, labels in test_loader:
-            output = model(inputs)
-            predictions.extend(output.view(-1).numpy())
+        for sequences, labels in test_loader:
+            outputs = model(sequences)
+            predictions.extend(outputs.view(-1).numpy())
             true_labels.extend(labels.view(-1).numpy())
 
     predictions = np.array(predictions)
@@ -439,7 +500,8 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
     adjusted_predictions = np.where(final_predictions == 0, -1, 1)
     adjusted_true_labels = np.where(true_labels == 0, -1, 1)
 
-    results_df = testing_set[['time', 'Actual Movement', 'close']].reset_index(drop=True)
+    # Prepare results DataFrame by selecting the subset that corresponds to predictions
+    results_df = testing_set.iloc[sequence_length:][['time', 'Actual Movement', 'close']].reset_index(drop=True)
     results_df['Predictions'] = predictions
     results_df['Predicted'] = adjusted_predictions
 
@@ -492,7 +554,7 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
 
 def get_model_path(folder_name):
     # Construct the path to the model file within the specified folder
-    model_path = os.path.join(folder_name, 'mlp_model.pth')
+    model_path = os.path.join(folder_name, 'lstm_model.pth')
 
     print(model_path)
     
@@ -500,66 +562,6 @@ def get_model_path(folder_name):
         raise FileNotFoundError(f"Model file not found in directory {folder_name}")
     
     return model_path
-
-def get_scaler_path(folder_name):
-    # Construct the path to the model file within the specified folder
-    scaler_path = os.path.join(folder_name, 'scaler.pkl')
-    
-    if not os.path.exists(scaler_path):
-        raise FileNotFoundError(f"Model file not found in directory {folder_name}")
-    
-    return scaler_path
-
-def predict_next_futures():
-
-    # Load the latest chart data
-    dataset = read_csv_to_dataframe('Chart_Latest.csv')
-
-    # Calculate movement for the dataset
-    calculate_movement(dataset)
-
-    # Select the last five rows but remove the very last one
-    last_five_rows = dataset.tail(5).drop(dataset.tail(1).index)
-
-    # Select only the last row (latest data point)
-    latest_row = last_five_rows.tail(1)
-
-    latest_row = latest_row.reset_index()
-
-    print(latest_row)
-
-    # Since this is a prediction for the future, we assume no 'Actual Movement' available
-    # Prepare data (you need to ensure your preprocessing function can handle single row)
-    X, _ = preprocess_data(latest_row)
-
-    # Convert to PyTorch tensors
-    X_tensor = torch.FloatTensor(X)
-
-    # Load the model (ensure it's already trained and the state dict is available)
-    model = MLPModel(input_size=X.shape[1])
-    model_path = get_model_path(base_dir='agent_futures')  # Optionally pass accuracy if known
-    model.load_state_dict(torch.load(model_path))
-    model.eval()
-
-    # Make predictions
-    with torch.no_grad():
-        output = model(X_tensor)
-    
-    print(output)
-
-    # Load the optimal threshold (make sure you have this value saved from your training phase)
-    optimal_threshold = load_optimal_threshold_json(model_path)  # Implement this function to read the saved threshold
-
-    # Use the threshold to determine the predicted class
-    predicted_class = (output >= optimal_threshold).float()
-
-    # Convert the tensor to a numpy array for easier handling if necessary
-    predicted_movement = np.where(predicted_class.numpy().flatten() == 0, -1, 1)[0]  # [0] to get a single value
-
-    print(f'Predicted Movement is {predicted_movement}')
-
-    # Optionally, return the prediction or handle it as needed
-    return predicted_movement
 
 def find_recent_forex_agent_dir(pair='EURUSD', timeframe='DAILY', base_dir=None):
     # Use the current working directory if no base_dir is provided
@@ -598,7 +600,7 @@ def extract_info_from_folder_name(folder_name):
     else:
         raise ValueError("Folder name format is incorrect or missing essential information.")
 
-def predict_next_forex(choice):
+def predict_next_forex(choice, sequence_length):
     # Retrieve and store the current date
     current_date = str(datetime.now().date())
 
@@ -635,21 +637,25 @@ def predict_next_forex(choice):
 
     eur_usd_data = eur_usd_data.reset_index()
 
+    latest_10_rows = eur_usd_data.tail(sequence_length)
+
+    latest_10_rows_features_scaled = scale_data(latest_10_rows)
+
     latest_row = eur_usd_data.tail(1)
 
-    print(latest_row)
-
-    scaler_path = get_scaler_path(folder_name)
+    print(latest_10_rows)
 
     # Since this is a prediction for the future, we assume no 'Actual Movement' available
     # Prepare data (you need to ensure your preprocessing function can handle single row)
-    X, _ = preprocess_data(latest_row, scaler_path)
+    X, _ = create_sequences(latest_10_rows_features_scaled, sequence_length)
 
     # Convert to PyTorch tensors
     X_tensor = torch.FloatTensor(X)
 
+    input_dim = latest_10_rows_features_scaled.shape[1]  # Number of columns in the DataFrame
+
     # Load the model (ensure it's already trained and the state dict is available)
-    model = MLPModel(input_size=X.shape[1])
+    model = LSTMModel(input_dim=input_dim)
     model_path = get_model_path(folder_name)
     model.load_state_dict(torch.load(model_path))
     model.eval()
@@ -712,7 +718,7 @@ def try_parse_datetime(input_str):
         except ValueError:
             return None, False
 
-def predict_specific(choice):
+def predict_specific(choice, sequence_length):
     # Retrieve and store the current date
     current_date = str(datetime.now().date())
 
@@ -755,28 +761,34 @@ def predict_specific(choice):
 
     user_date, is_datetime = try_parse_datetime(user_date_str)
 
+    sequence_length = 10  # Example sequence length
+
     if user_date is None:
         print("Invalid format. Please enter the date in 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' format.")
     else:
         if user_date in dataset.index:
-            # Extract as DataFrame instead of Series
-            specific_row = dataset.loc[[user_date]]
-            specific_row = specific_row.reset_index()
-            print("Data on selected date:")
-            print(specific_row)
+            # First, ensure the DataFrame is sorted by the index (date in this case)
+            dataset_sorted = dataset.sort_index()
+            # Now, slice the DataFrame from the beginning to 'user_date'
+            data_up_to_date = dataset_sorted.loc[:user_date]
+            # Finally, get the last 10 rows from this sliced DataFrame
+            last_10_rows_up_to_date = data_up_to_date.tail(sequence_length)
         else:
             print("The specified date or datetime is not available in the dataset. Please choose another within the range.")
-        scaler_path = get_scaler_path(folder_name)
 
-    # Since this is a prediction for the future, we assume no 'Actual Movement' available
-    # Prepare data (you need to ensure your preprocessing function can handle single row)
-    X, _ = preprocess_data(specific_row, scaler_path)
+    last_10_rows_up_to_date_features_scaled = scale_data(last_10_rows_up_to_date)
+
+    labels = last_10_rows_up_to_date['Actual Movement'].values  # Only the labels column
+
+    X, _ = create_sequences(last_10_rows_up_to_date_features_scaled, sequence_length, labels)
 
     # Convert to PyTorch tensors
     X_tensor = torch.FloatTensor(X)
 
+    input_dim = last_10_rows_up_to_date_features_scaled.shape[1]  # Number of columns in the DataFrame
+
     # Load the model (ensure it's already trained and the state dict is available)
-    model = MLPModel(input_size=X.shape[1])
+    model = LSTMModel(input_dim=input_dim)
     model_path = get_model_path(folder_name)
     model.load_state_dict(torch.load(model_path))
     model.eval()
@@ -798,7 +810,7 @@ def predict_specific(choice):
 
     print(f'Predicted Movement is {predicted_movement}')
 
-def training_forex_multiple(choice, Pair, timeframe_str):
+def training_forex_multiple(choice, Pair, timeframe_str, sequence_length):
     current_date = str(datetime.now().date())
     strategy_start_date_all = "1971-01-04"
     strategy_end_date_all = current_date
@@ -823,8 +835,17 @@ def training_forex_multiple(choice, Pair, timeframe_str):
 
     fit_and_save_scaler(training_set)
 
-    X_train, y_train = preprocess_data(training_set)
-    X_test, y_test = preprocess_data(testing_set)
+    # Drop the 'Actual Movement' column from the testing set
+    testing_set_features_scaled = scale_data(testing_set)
+    training_set_features_scaled = scale_data(training_set)
+
+    labels_testing = testing_set['Actual Movement'].values  # Only the labels column
+    labels_training = training_set['Actual Movement'].values  # Only the labels column
+
+    input_dim = testing_set_features_scaled.shape[1]  # Number of columns in the DataFrame
+
+    X_train, y_train = create_sequences(training_set_features_scaled, sequence_length, labels_training)
+    X_test, y_test = create_sequences(testing_set_features_scaled, sequence_length, labels_testing)
 
     # Convert to PyTorch tensors
     X_train_tensor = torch.FloatTensor(X_train)
@@ -839,7 +860,7 @@ def training_forex_multiple(choice, Pair, timeframe_str):
     train_loader = DataLoader(train_dataset, batch_size=batch_size)
     val_loader = DataLoader(test_dataset, batch_size=batch_size)
 
-    model = MLPModel(input_size=X_train.shape[1])
+    model = LSTMModel(input_dim=input_dim)
     loss_function = BCELoss()
     optimizer = Adam(model.parameters(), lr=0.001, weight_decay=0.01)  # Adding weight decay for L2 regularization
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
@@ -850,7 +871,7 @@ def training_forex_multiple(choice, Pair, timeframe_str):
     train_losses = []
     val_losses = []
 
-    patience = 20
+    patience = 10
     min_delta = 0.01
     best_val_loss = float('inf')
     no_improvement_count = 0
@@ -858,9 +879,9 @@ def training_forex_multiple(choice, Pair, timeframe_str):
     for epoch in range(epochs):
         model.train()
         train_loss = 0
-        for inputs, labels in train_loader:
+        for sequences, labels in train_loader:
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(sequences)
             loss = loss_function(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -869,8 +890,8 @@ def training_forex_multiple(choice, Pair, timeframe_str):
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for inputs, labels in val_loader:
-                outputs = model(inputs)
+            for sequences, labels in val_loader:
+                outputs = model(sequences)
                 loss = loss_function(outputs, labels)
                 val_loss += loss.item()
 
@@ -887,7 +908,7 @@ def training_forex_multiple(choice, Pair, timeframe_str):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             no_improvement_count = 0
-            torch.save(model.state_dict(), 'mlp_model.pth')
+            torch.save(model.state_dict(), 'lstm_model.pth')
             print("Validation loss decreased, saving model...")
         else:
             no_improvement_count += 1
@@ -896,11 +917,11 @@ def training_forex_multiple(choice, Pair, timeframe_str):
                 print("Early stopping triggered")
                 break
 
-    print("Training completed. Best model saved as 'mlp_model.pth'.")
+    print("Training completed. Best model saved as 'lstm_model.pth'.")
 
-    evaluate(choice, Pair, timeframe_str)
+    evaluate(choice, Pair, timeframe_str, sequence_length)
 
-    backtest_trades_with_dataframe(choice, timeframe_str, Pair)
+    backtest_trades_with_dataframe(choice, timeframe_str, Pair, sequence_length)
 
 def fetch_forex_pairs():
     account_number = 530064788
@@ -936,7 +957,7 @@ def fetch_forex_pairs():
 
     return forex_pairs
 
-def main_training_loop_multiple_pairs():
+def main_training_loop_multiple_pairs(sequence_length):
     """
     forex_pairs = fetch_forex_pairs()
     if forex_pairs is None:
@@ -952,9 +973,9 @@ def main_training_loop_multiple_pairs():
 
     for pair in forex_pairs:
         print(f"Training for {pair} on {timeframe}")
-        training_forex_multiple(choice, pair, timeframe)
+        training_forex_multiple(choice, pair, timeframe, sequence_length)
 
-def training(choice):
+def training(choice, sequence_length):
     if choice == '1':
         # Retrieve and store the current date
         current_date = str(datetime.now().date())
@@ -1013,8 +1034,17 @@ def training(choice):
 
     fit_and_save_scaler(training_set)
 
-    X_train, y_train = preprocess_data(training_set)
-    X_test, y_test = preprocess_data(testing_set)
+    # Drop the 'Actual Movement' column from the testing set
+    testing_set_features_scaled = scale_data(testing_set)
+    training_set_features_scaled = scale_data(training_set)
+
+    labels_testing = testing_set['Actual Movement'].values  # Only the labels column
+    labels_training = training_set['Actual Movement'].values  # Only the labels column
+
+    input_dim = testing_set_features_scaled.shape[1]  # Number of columns in the DataFrame
+
+    X_train, y_train = create_sequences(training_set_features_scaled, sequence_length, labels_training)
+    X_test, y_test = create_sequences(testing_set_features_scaled, sequence_length, labels_testing)
 
     # Convert to PyTorch tensors
     X_train_tensor = torch.FloatTensor(X_train)
@@ -1029,7 +1059,9 @@ def training(choice):
     train_loader = DataLoader(train_dataset, batch_size=batch_size)
     val_loader = DataLoader(test_dataset, batch_size=batch_size)
 
-    model = MLPModel(input_size=X_train.shape[1])
+    input_dim = training_set_features_scaled.shape[1]  # Number of columns in the DataFrame
+
+    model = LSTMModel(input_dim=input_dim)
     loss_function = BCELoss()
     optimizer = Adam(model.parameters(), lr=0.001, weight_decay=0.01)  # Adding weight decay for L2 regularization
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
@@ -1040,7 +1072,7 @@ def training(choice):
     train_losses = []
     val_losses = []
 
-    patience = 20
+    patience = 10
     min_delta = 0.01
     best_val_loss = float('inf')
     no_improvement_count = 0
@@ -1048,19 +1080,19 @@ def training(choice):
     for epoch in range(epochs):
         model.train()
         train_loss = 0
-        for inputs, labels in train_loader:
+        for sequences, labels in train_loader:
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(sequences)
             loss = loss_function(outputs, labels)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-
+        
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for inputs, labels in val_loader:
-                outputs = model(inputs)
+            for sequences, labels in val_loader:
+                outputs = model(sequences)
                 loss = loss_function(outputs, labels)
                 val_loss += loss.item()
 
@@ -1077,7 +1109,7 @@ def training(choice):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             no_improvement_count = 0
-            torch.save(model.state_dict(), 'mlp_model.pth')
+            torch.save(model.state_dict(), 'lstm_model.pth')
             print("Validation loss decreased, saving model...")
         else:
             no_improvement_count += 1
@@ -1086,9 +1118,9 @@ def training(choice):
                 print("Early stopping triggered")
                 break
 
-    print("Training completed. Best model saved as 'mlp_model.pth'.")
+    print("Training completed. Best model saved as 'lstm_model.pth'.")
 
-    evaluate(choice, Pair, timeframe_str)
+    evaluate(choice, Pair, timeframe_str, sequence_length)
 
     backtest_trades_with_dataframe(choice, timeframe_str, Pair)
 
@@ -1514,7 +1546,6 @@ def main_menu():
         print("\nMain Menu:")
         print("1 - Train model with latest data - Forex")
         print("2 - Train model with csv file data - futures")
-        print("3 - Predict Next- futures")
         print("4 - Predict Next- forex")
         print("5 - Predict Specific Date- forex")
         print("6 - Train Multiple - forex")
@@ -1525,23 +1556,21 @@ def main_menu():
 
         choice = input("Enter your choice (1/2/3): ")
 
+        sequence_length=10
+
         if choice == '1':
-            training(choice)
+            training(choice, sequence_length)
             break
         elif choice == '2':
-            training(choice)
-            break
-        elif choice == '3':
-            predict_next_futures()
-            break
+            training(choice, sequence_length)
         elif choice == '4':
-            predict_next_forex(choice)
+            predict_next_forex(choice, sequence_length)
             break
         elif choice == '5':
-            predict_specific(choice)
+            predict_specific(choice, sequence_length)
             break
         elif choice == '6':
-            main_training_loop_multiple_pairs()
+            main_training_loop_multiple_pairs(sequence_length)
             break
         elif choice == '7':
             backtest_trades_with_dataframe(choice)
