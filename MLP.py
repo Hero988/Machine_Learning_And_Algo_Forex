@@ -19,24 +19,32 @@ import json
 import shutil
 import matplotlib.pyplot as plt
 import joblib
-import time
+import torch.nn as nn
+import torch.nn.functional as F
 
-class MLPModel(torch.nn.Module):
-    def __init__(self, input_size, hidden_sizes=[100, 50], dropout_rates=[0.2, 0.5], output_size=1):
+class MLPModel(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[100, 75, 50, 25], dropout_rates=[0.2, 0.3, 0.4, 0.5], output_size=1):
         super(MLPModel, self).__init__()
-        self.layers = torch.nn.Sequential(
-            torch.nn.Linear(input_size, hidden_sizes[0]),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout_rates[0]),
-            torch.nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout_rates[1]),
-            torch.nn.Linear(hidden_sizes[1], output_size),
-            torch.nn.Sigmoid()
+        # Initialize layers dynamically
+        self.layers = nn.ModuleList()
+        # Construct the hidden layers
+        layer_sizes = [input_size] + hidden_sizes
+        for i in range(len(hidden_sizes)):
+            self.layers.append(nn.Linear(layer_sizes[i], layer_sizes[i+1]))
+            self.layers.append(nn.ReLU())  # Consider using other activations like nn.LeakyReLU() or nn.ELU()
+            self.layers.append(nn.Dropout(dropout_rates[i]))
+        
+        # Output layer
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_sizes[-1], output_size),
+            nn.Sigmoid()
         )
 
     def forward(self, x):
-        return self.layers(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.output_layer(x)
+        return x
 
 def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
 
@@ -205,6 +213,8 @@ def calculate_indicators(data, choice):
     # Shift the 'close' column up to get the next 'close' price in the future
     data['close_price_next'] = data['close'].shift(-1)
 
+    data['close_price_previous'] = data['close'].shift(1)
+
     # Calculate the 'Actual Movement' based on the future price movement
     data['Actual Movement'] = np.where(data['close_price_next'] > data['close'], 1,
                                        np.where(data['close_price_next'] < data['close'], -1, 0))
@@ -213,6 +223,12 @@ def calculate_indicators(data, choice):
     data.drop(columns=['close_price_next'], inplace=True)
 
     data['close_price_percentage_change'] = data['close'].pct_change().fillna(0) * 100
+    data['previous_close_price_percentage_change'] = data['close_price_percentage_change'].shift(1)
+
+    data['Actual Movement Previous'] = data['Actual Movement'].shift(1)
+
+    data['day_of_week'] = data.index.dayofweek
+    data['month_of_year'] = data.index.month
 
     if choice == '1':
         # Remove the last row of the DataFrame
@@ -481,7 +497,7 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
     plt.savefig('confusion_matrix.png')  # Save to the file system of this environment
 
     # Save all files except the specified ones
-    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv']
+    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'RNN_LSTM.py']
     for file in os.listdir('.'):
         if file not in exclude_files and os.path.isfile(file):
             shutil.move(file, os.path.join(save_directory, file))
@@ -850,7 +866,7 @@ def training_forex_multiple(choice, Pair, timeframe_str):
     train_losses = []
     val_losses = []
 
-    patience = 10
+    patience = 20
     min_delta = 0.01
     best_val_loss = float('inf')
     no_improvement_count = 0
@@ -884,7 +900,7 @@ def training_forex_multiple(choice, Pair, timeframe_str):
 
         scheduler.step(val_loss)  # Adjust learning rate based on the validation loss
 
-        if val_loss < best_val_loss - min_delta:
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
             no_improvement_count = 0
             torch.save(model.state_dict(), 'mlp_model.pth')
@@ -1040,7 +1056,7 @@ def training(choice):
     train_losses = []
     val_losses = []
 
-    patience = 10
+    patience = 20
     min_delta = 0.01
     best_val_loss = float('inf')
     no_improvement_count = 0
@@ -1074,7 +1090,7 @@ def training(choice):
 
         scheduler.step(val_loss)  # Adjust learning rate based on the validation loss
 
-        if val_loss < best_val_loss - min_delta:
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
             no_improvement_count = 0
             torch.save(model.state_dict(), 'mlp_model.pth')

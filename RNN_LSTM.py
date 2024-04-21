@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_curve, f1_score
 from sklearn.preprocessing import MinMaxScaler
 from torch.nn import BCELoss
 from torch.optim import Adam
@@ -23,7 +23,7 @@ import joblib
 import torch.nn.functional as F
 
 class RNNModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, layer_dim, output_dim):
+    def __init__(self, input_dim, hidden_dim=50, layer_dim=3, output_dim=1):
         super(RNNModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.layer_dim = layer_dim
@@ -47,50 +47,64 @@ class RNNModel(nn.Module):
         # Reshape the data for feed into Fully connected layer
         out = self.fc(out[:, -1, :])  # take the last sequence output
         return torch.sigmoid(out)
-    
+
+class AttentionModule(nn.Module):
+    def __init__(self, input_dim):
+        super(AttentionModule, self).__init__()
+        self.attention = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        # x shape: (batch, seq_len, features)
+        scores = self.attention(x)  # Shape: (batch, seq_len, 1)
+        weights = F.softmax(scores, dim=1)
+        weighted = torch.mul(x, weights)
+        return weighted.sum(dim=1)  # Sum over the sequence dimension
+
 class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, layer_dim, output_dim, bidirectional=True, dropout_rate=0.5):
+    def __init__(self, input_dim, hidden_dim=150, layer_dim=3, output_dim=1, bidirectional=True, dropout_rate=0.5):
         super(LSTMModel, self).__init__()
         self.hidden_dim = hidden_dim
-        self.layer_dim = layer_dim
+        self.layer_dim = layer_dim  # ensure this is properly defined
         
         # Bidirectional LSTM Layer with dropout
         self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim, batch_first=True, 
                             bidirectional=bidirectional, dropout=dropout_rate if layer_dim > 1 else 0)
         
-        # Define additional fully connected layers with dropout layers
+        # Attention Module
+        self.attention = AttentionModule(hidden_dim * 2 if bidirectional else hidden_dim)
+        
+        # Fully connected layers with dropout
         self.fc1 = nn.Linear(hidden_dim * 2 if bidirectional else hidden_dim, hidden_dim * 4)
-        self.dropout1 = nn.Dropout(dropout_rate)  # Dropout layer after the first FC layer
+        self.dropout1 = nn.Dropout(dropout_rate)
         self.fc2 = nn.Linear(hidden_dim * 4, hidden_dim * 2)
-        self.dropout2 = nn.Dropout(dropout_rate)  # Dropout layer after the second FC layer
-        self.fc3 = nn.Linear(hidden_dim * 2, output_dim)  # Final output layer
+        self.dropout2 = nn.Dropout(dropout_rate)
+        self.fc3 = nn.Linear(hidden_dim * 2, output_dim)
 
     def forward(self, x):
-        # Initialize hidden and cell states with zeros
-        h0 = torch.zeros(self.layer_dim * 2 if self.lstm.bidirectional else self.layer_dim, 
-                         x.size(0), self.hidden_dim).to(x.device)
-        c0 = torch.zeros(self.layer_dim * 2 if self.lstm.bidirectional else self.layer_dim, 
-                         x.size(0), self.hidden_dim).to(x.device)
+        # Initialize hidden and cell states
+        h0, c0 = self.init_hidden(x)
         
         # Forward propagate LSTM
-        out, (hn, cn) = self.lstm(x, (h0, c0))
+        lstm_out, _ = self.lstm(x, (h0, c0))
         
-        # Handle the bidirectional output by concatenating the hidden states
-        if self.lstm.bidirectional:
-            out = torch.cat((hn[-2,:,:], hn[-1,:,:]), dim=1)
-        else:
-            out = hn[-1,:,:]
+        # Apply attention
+        attention_out = self.attention(lstm_out)
         
-        # Feeding the output of LSTM through fully connected layers with ReLU activation and dropout
-        out = self.fc1(out)
-        out = F.relu(out)
-        out = self.dropout1(out)
-        out = self.fc2(out)
-        out = F.relu(out)
-        out = self.dropout2(out)
-        out = self.fc3(out)
+        # Passing through the fully connected layers
+        x = self.fc1(attention_out)
+        x = F.relu(self.dropout1(x))
+        x = self.fc2(x)
+        x = F.relu(self.dropout2(x))
+        x = self.fc3(x)
         
-        return torch.sigmoid(out)  # Applying sigmoid activation function for binary classification
+        return torch.sigmoid(x)
+
+    def init_hidden(self, x):
+        batch_size = x.size(0)
+        num_directions = 2 if self.lstm.bidirectional else 1
+        h0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim).to(x.device)
+        c0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim).to(x.device)
+        return h0, c0
     
 def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
 
@@ -256,17 +270,26 @@ def calculate_indicators(data, choice):
     data['Stoch_%K'] = stoch['STOCHk_14_3_3']
     data['Stoch_%D'] = stoch['STOCHd_14_3_3']
 
+    data['close_price_previous'] = data['close'].shift(1)
+    
+    data['close_price_percentage_change'] = data['close'].pct_change() * 100
+    data['close_price_previous_percentage_change'] = data['close_price_percentage_change'].shift(1)
+    
+    # Time-based features
+    data['day_of_week'] = data.index.dayofweek
+    data['month_of_year'] = data.index.month
+
     # Shift the 'close' column up to get the next 'close' price in the future
     data['close_price_next'] = data['close'].shift(-1)
 
     # Calculate the 'Actual Movement' based on the future price movement
     data['Actual Movement'] = np.where(data['close_price_next'] > data['close'], 1,
                                        np.where(data['close_price_next'] < data['close'], -1, 0))
+    
+    data['Actual Movement Previous'] = data['Actual Movement'].shift(1)
 
     # Drop the 'close_price_next' column if you no longer need it
     data.drop(columns=['close_price_next'], inplace=True)
-
-    data['close_price_percentage_change'] = data['close'].pct_change().fillna(0) * 100
 
     if choice == '1':
         # Remove the last row of the DataFrame
@@ -285,8 +308,8 @@ def calculate_movement(data):
         # Rename the column
         data.rename(columns={'Close': 'close'}, inplace=True)
 
-    data['close_price_percentage_change'] = data['close'].pct_change().fillna(0) * 100
-    data['close_price_previous_percentage_change'] = data['close_price_percentage_change'].shift(1).fillna(0)
+    data['close_price_percentage_change'] = data['close'].pct_change() * 100
+    data['close_price_previous_percentage_change'] = data['close_price_percentage_change'].shift(1)
     # Shift the 'close' column up to get the next 'close' price in the future
     data['close_price_next'] = data['close'].shift(-1)
 
@@ -517,7 +540,7 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A', sequence_length=None):
     # Assuming the sequence length and input dimension are defined
     input_dim = testing_set_features_scaled.shape[1]  # Number of columns in the DataFrame
 
-    model = LSTMModel(input_dim=input_dim, hidden_dim=50, layer_dim=1, output_dim=1)
+    model = LSTMModel(input_dim=input_dim)
     model.load_state_dict(torch.load('lstm_model.pth'))  # Ensure you have trained and saved the RNN model
     model.eval()
 
@@ -700,7 +723,7 @@ def predict_next_forex(choice, sequence_length):
     input_dim = latest_10_rows_features_scaled.shape[1]  # Number of columns in the DataFrame
 
     # Load the model (ensure it's already trained and the state dict is available)
-    model = LSTMModel(input_dim=input_dim, hidden_dim=50, layer_dim=1, output_dim=1)
+    model = LSTMModel(input_dim=input_dim)
     model_path = get_model_path(folder_name)
     model.load_state_dict(torch.load(model_path))
     model.eval()
@@ -833,7 +856,7 @@ def predict_specific(choice, sequence_length):
     input_dim = last_10_rows_up_to_date_features_scaled.shape[1]  # Number of columns in the DataFrame
 
     # Load the model (ensure it's already trained and the state dict is available)
-    model = LSTMModel(input_dim=input_dim, hidden_dim=50, layer_dim=1, output_dim=1)
+    model = LSTMModel(input_dim=input_dim)
     model_path = get_model_path(folder_name)
     model.load_state_dict(torch.load(model_path))
     model.eval()
@@ -905,7 +928,7 @@ def training_forex_multiple(choice, Pair, timeframe_str, sequence_length):
     train_loader = DataLoader(train_dataset, batch_size=batch_size)
     val_loader = DataLoader(test_dataset, batch_size=batch_size)
 
-    model = LSTMModel(input_dim=input_dim, hidden_dim=50, layer_dim=1, output_dim=1)
+    model = LSTMModel(input_dim=input_dim)
     loss_function = BCELoss()
     optimizer = Adam(model.parameters(), lr=0.001)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
@@ -1106,7 +1129,7 @@ def training(choice, sequence_length):
 
     input_dim = training_set_features_scaled.shape[1]  # Number of columns in the DataFrame
 
-    model = LSTMModel(input_dim=input_dim, hidden_dim=50, layer_dim=1, output_dim=1)
+    model = LSTMModel(input_dim=input_dim)
     loss_function = BCELoss()
     optimizer = Adam(model.parameters(), lr=0.001)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
@@ -1601,7 +1624,7 @@ def main_menu():
 
         choice = input("Enter your choice (1/2/3): ")
 
-        sequence_length=14
+        sequence_length=10
 
         if choice == '1':
             training(choice, sequence_length)
