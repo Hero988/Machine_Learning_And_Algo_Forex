@@ -22,33 +22,21 @@ import matplotlib.pyplot as plt
 import joblib
 import torch.nn.functional as F
 
-class AttentionModule(nn.Module):
-    def __init__(self, input_dim):
-        super(AttentionModule, self).__init__()
-        self.attention = nn.Linear(input_dim, 1)
-
-    def forward(self, x):
-        # x shape: (batch, seq_len, features)
-        scores = self.attention(x)  # Shape: (batch, seq_len, 1)
-        weights = F.softmax(scores, dim=1)
-        weighted = torch.mul(x, weights)
-        return weighted.sum(dim=1)  # Sum over the sequence dimension
-
 class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim=150, layer_dim=3, output_dim=1, bidirectional=True, dropout_rate=0.5):
+    def __init__(self, input_dim, hidden_dim=150, layer_dim=3, output_dim=1, bidirectional=False, dropout_rate=0.5):
         super(LSTMModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.layer_dim = layer_dim
         
-        # Bidirectional LSTM Layer with dropout
+        # Defining the LSTM layer
+        # Each layer is an LSTM cell, and 'layer_dim' defines how many layers/levels of cells we have.
         self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim, batch_first=True, 
                             bidirectional=bidirectional, dropout=dropout_rate if layer_dim > 1 else 0)
         
-        # Attention Module
-        self.attention = AttentionModule(hidden_dim * 2 if bidirectional else hidden_dim)
-        
-        # Fully connected layers with dropout
-        self.fc1 = nn.Linear(hidden_dim * 2 if bidirectional else hidden_dim, hidden_dim * 4)
+        # Fully connected layers to process after LSTM output
+        # If bidirectional, output features will be hidden_dim * 2, otherwise just hidden_dim
+        fc_input_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        self.fc1 = nn.Linear(fc_input_dim, hidden_dim * 4)
         self.dropout1 = nn.Dropout(dropout_rate)
         self.fc2 = nn.Linear(hidden_dim * 4, hidden_dim * 2)
         self.dropout2 = nn.Dropout(dropout_rate)
@@ -56,28 +44,30 @@ class LSTMModel(nn.Module):
 
     def forward(self, x):
         # Initialize hidden and cell states
-        h0, c0 = self.init_hidden(x)
+        # Dimensions: num_layers * num_directions, batch, hidden_size
+        h0, c0 = self.init_hidden(x.size(0), x.device)
         
         # Forward propagate LSTM
+        # Output of lstm_out is from the top layer of the LSTM
         lstm_out, _ = self.lstm(x, (h0, c0))
         
-        # Apply attention
-        attention_out = self.attention(lstm_out)
+        # Only applying dropout to the output of the last LSTM layer
+        lstm_out = self.dropout1(lstm_out[:, -1, :])  # Take the last sequence part and apply dropout
         
         # Passing through the fully connected layers
-        x = self.fc1(attention_out)
-        x = F.relu(self.dropout1(x))
-        x = self.fc2(x)
-        x = F.relu(self.dropout2(x))
-        x = self.fc3(x)
+        x = F.relu(self.fc1(lstm_out))
+        x = F.relu(self.fc2(self.dropout1(x)))
+        x = self.fc3(self.dropout2(x))
         
+        # Activation function (sigmoid) should be decided based on the specific needs (binary, regression, etc.)
         return torch.sigmoid(x)
 
-    def init_hidden(self, x):
-        batch_size = x.size(0)
+    def init_hidden(self, batch_size, device):
+        # Method for initializing hidden and cell states
+        # Generate zero initial states for both hidden state and cell state
         num_directions = 2 if self.lstm.bidirectional else 1
-        h0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim).to(x.device)
-        c0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim).to(x.device)
+        h0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim).to(device)
+        c0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim).to(device)
         return h0, c0
     
 def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
@@ -178,9 +168,7 @@ def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
 def calculate_indicators(data, choice):
     bollinger_length=12
     bollinger_std_dev=1.5
-    sma_trend_length=50
-    window=9
-    print("Doing calculate_indicators function")
+
     # Calculate the 50-period simple moving average of the 'close' price
     data['SMA_50'] = ta.sma(data['close'], length=50)
     # Calculate the 200-period simple moving average of the 'close' price
@@ -215,13 +203,7 @@ def calculate_indicators(data, choice):
     data['Signal_Line'] = macd['MACDs_12_26_9']
     
     # Calculate the Relative Strength Index (RSI) with the specified window length
-    data[f'RSI_{window}'] = ta.rsi(data['close'], length=window).round(2)
-
-    # Calculate a 5-period RSI for scalping strategies
-    data[f'RSI_5 Scalping'] = ta.rsi(data['close'], length=5).round(2)
-
-    # Calculate a simple moving average for trend analysis in scalping strategies
-    data[f'SMA_{sma_trend_length}'] = ta.sma(data['close'], length=sma_trend_length)
+    data[f'RSI_14'] = ta.rsi(data['close'], length=14).round(2)
 
     # Calculate the Stochastic Oscillator
     stoch = ta.stoch(data['high'], data['low'], data['close'])
@@ -379,15 +361,15 @@ def scale_data(data, scaler=None, scaler_path=None):
         else:
             scaler = joblib.load(scaler_path)
 
-    data_numeric = data.drop(columns=['time', 'Actual Movement']).values
+    data_numeric = data.drop(columns=['time', 'Actual Movement', 'open', 'high', 'low', 'tick_volume', 'spread', 'real_volume']).values
     # Transform the data using the loaded scaler
     data_scaled = scaler.transform(data_numeric)
     return data_scaled
 
 def fit_and_save_scaler(data, scaler_path='scaler.pkl'):
-    scaler = MinMaxScaler()
+    scaler = MinMaxScaler(feature_range=(0,1))
     # Assuming 'time' and 'Actual Movement' are non-numeric columns we want to drop for training
-    data_numeric = data.drop(columns=['time', 'Actual Movement']).values
+    data_numeric = data.drop(columns=['time', 'Actual Movement', 'open', 'high', 'low', 'tick_volume', 'spread', 'real_volume']).values
     
     # Fit the scaler on the data
     scaler.fit(data_numeric)
@@ -631,8 +613,9 @@ def predict_next_forex(choice, sequence_length):
     # Fetch and prepare the FX data for the specified currency pair and timeframe
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
-    # Apply technical indicators to the data using the 'calculate_indicators' function
-    eur_usd_data = calculate_indicators(eur_usd_data, choice) 
+    #eur_usd_data = calculate_indicators(eur_usd_data, choice) 
+
+    calculate_movement(eur_usd_data)
 
     # Drop rows where any of the data is missing
     eur_usd_data = eur_usd_data.dropna()
@@ -749,8 +732,9 @@ def predict_specific(choice, sequence_length):
     # Fetch and prepare the FX data for the specified currency pair and timeframe
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
-    # Apply technical indicators to the data using the 'calculate_indicators' function
-    eur_usd_data = calculate_indicators(eur_usd_data, choice) 
+    #eur_usd_data = calculate_indicators(eur_usd_data, choice) 
+
+    calculate_movement(eur_usd_data)
 
     # Filter the EUR/USD data for the in-sample training period
     dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
@@ -826,7 +810,8 @@ def training_forex_multiple(choice, Pair, timeframe_str, sequence_length):
     training_end_date = current_date
 
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
-    eur_usd_data = calculate_indicators(eur_usd_data, choice)
+    #eur_usd_data = calculate_indicators(eur_usd_data, choice)
+    calculate_movement(eur_usd_data)
     dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
     dataset = dataset.dropna()
 
@@ -909,7 +894,7 @@ def training_forex_multiple(choice, Pair, timeframe_str, sequence_length):
 
         scheduler.step(val_loss)  # Adjust learning rate based on the validation loss
 
-        if val_loss < best_val_loss - min_delta:
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
             no_improvement_count = 0
             torch.save(model.state_dict(), 'lstm_model.pth')
@@ -925,7 +910,7 @@ def training_forex_multiple(choice, Pair, timeframe_str, sequence_length):
 
     evaluate(choice, Pair, timeframe_str, sequence_length)
 
-    backtest_trades_with_dataframe(choice, timeframe_str, Pair, sequence_length)
+    backtest_trades_with_dataframe(choice, timeframe_str, Pair)
 
 def fetch_forex_pairs():
     account_number = 530064788
@@ -1007,10 +992,9 @@ def training(choice, sequence_length):
         # Fetch and prepare the FX data for the specified currency pair and timeframe
         eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
-        # Apply technical indicators to the data using the 'calculate_indicators' function
-        eur_usd_data = calculate_indicators(eur_usd_data, choice)
+        #eur_usd_data = calculate_indicators(eur_usd_data, choice)
 
-        #calculate_movement(eur_usd_data)
+        calculate_movement(eur_usd_data)
 
         # Filter the EUR/USD data for the in-sample training period
         dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
@@ -1112,7 +1096,7 @@ def training(choice, sequence_length):
 
         scheduler.step(val_loss)  # Adjust learning rate based on the validation loss
 
-        if val_loss < best_val_loss - min_delta:
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
             no_improvement_count = 0
             torch.save(model.state_dict(), 'lstm_model.pth')
@@ -1562,7 +1546,7 @@ def main_menu():
 
         choice = input("Enter your choice (1/2/3): ")
 
-        sequence_length=10
+        sequence_length=3
 
         if choice == '1':
             training(choice, sequence_length)

@@ -1,0 +1,55 @@
+def trend_identification(data, window_size):
+    # Calculate rolling maximum of highs and minimum of lows
+    data['rolling_max_high'] = data['high'].rolling(window=window_size).max()
+    data['rolling_min_low'] = data['low'].rolling(window=window_size).min()
+
+    # Identify if the current high is higher or lower than the rolling max from the previous period
+    data['higher_highs'] = data['high'] > data['rolling_max_high'].shift(1)
+    data['lower_highs'] = data['high'] < data['rolling_max_high'].shift(1)
+
+    # Identify if the current low is higher or lower than the rolling min from the previous period
+    data['higher_lows'] = data['low'] > data['rolling_min_low'].shift(1)
+    data['lower_lows'] = data['low'] < data['rolling_min_low'].shift(1)
+
+    # Aggregate counts of conditions within the window
+    data['count_higher_highs'] = data['higher_highs'].rolling(window=window_size).sum()
+    data['count_higher_lows'] = data['higher_lows'].rolling(window=window_size).sum()
+    data['count_lower_highs'] = data['lower_highs'].rolling(window=window_size).sum()
+    data['count_lower_lows'] = data['lower_lows'].rolling(window=window_size).sum()
+
+    # Define trend based on majority vote
+    data['uptrend'] = (data['count_higher_highs'] + data['count_higher_lows']) > \
+                      (data['count_lower_highs'] + data['count_lower_lows'])
+
+    data['downtrend'] = (data['count_lower_highs'] + data['count_lower_lows']) > \
+                        (data['count_higher_highs'] + data['count_higher_lows'])
+
+    data['consolidation'] = ~data['uptrend'] & ~data['downtrend']
+
+    # Store last higher low and lower high for retest
+    data['last_higher_low'] = data['low'].where(data['higher_lows']).ffill()
+    data['last_lower_high'] = data['high'].where(data['lower_highs']).ffill()
+
+    # Flag potential breakdown and breakout retests
+    data['potential_breakdown_retest'] = data['low'] < data['last_higher_low']
+    data['potential_breakout_retest'] = data['high'] > data['last_lower_high']
+
+    # Use rolling to check within 5 days window for confirmation conditions
+    # This replaces the previous direct lambda function approach with pre-computed boolean columns
+    for shift in range(1, 6):  # Check the next 5 days
+        data[f'breakdown_retest_day_{shift}'] = (
+            data['potential_breakdown_retest'].shift(shift) &
+            (data['high'].shift(shift) >= data['last_higher_low'].shift(shift)) &
+            (data['high'].shift(shift + 1) < data['high'].shift(shift))
+        )
+        data[f'breakout_retest_day_{shift}'] = (
+            data['potential_breakout_retest'].shift(shift) &
+            (data['low'].shift(shift) <= data['last_lower_high'].shift(shift)) &
+            (data['low'].shift(shift + 1) > data['low'].shift(shift))
+        )
+
+    # Aggregate any true condition over the 5 days to confirm the trend change
+    data['confirm_breakdown_retest'] = data[[f'breakdown_retest_day_{i}' for i in range(1, 6)]].any(axis=1)
+    data['confirm_breakout_retest'] = data[[f'breakout_retest_day_{i}' for i in range(1, 6)]].any(axis=1)
+
+    data.drop(columns=['lower_lows', 'lower_highs', 'higher_lows', 'higher_highs', 'rolling_max_high', 'rolling_min_low', 'count_higher_highs', 'count_higher_lows', 'count_lower_highs', 'count_lower_lows', 'last_higher_low', 'last_lower_high'], inplace=True)

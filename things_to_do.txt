@@ -1,0 +1,1 @@
+add grid search to find the best window_length and the best look forward period i.e. persistence_period = 5

@@ -222,12 +222,47 @@ def calculate_movement(data):
                               np.where(data['close_price_next'] < data['close'], -1, 0))
     data.drop(columns=['close_price_next'], inplace=True)
 
-    # Adding rolling features, ratios, and more complex indicators
-    horizons = [2, 5, 60, 250, 1000]
-    for horizon in horizons:
-        rolling_mean = data['close'].rolling(window=horizon).mean()
-        data[f'Close_Ratio_{horizon}'] = data['close'] / rolling_mean
-        data[f'Trend_{horizon}'] = data['target'].shift(1).rolling(window=horizon).sum()
+    # Calculate the percentage change
+    data['percentage_change'] = data['close'].pct_change() * 100
+
+    # Initialize candlestick pattern encoding
+    data['candlestick_pattern'] = 0  # Default to 'No pattern'
+
+        
+    # Identify Bull, Bear, or Neutral candle
+    data['candle_type'] = np.where(data['close'] > data['open'], 1,
+                                   np.where(data['close'] < data['open'], -1, 0))
+    
+    # Doji
+    doji_mask = ((data['close'] == data['open']) | 
+                 (abs(data['close'] - data['open']) < (data['high'] - data['low']) * 0.1))
+    data.loc[doji_mask, 'candlestick_pattern'] = 1
+    
+    # Improved Bullish Engulfing
+    bullish_engulfing_mask = ((data['open'] < data['close']) &  # Current is a bull candle
+                              (data['open'].shift(1) > data['close'].shift(1)) &  # Previous is a bear candle
+                              (data['open'] < data['close'].shift(1)) &  # Current open is less than previous close
+                              (data['close'] > data['open'].shift(1)))  # Current close is more than previous open
+    data.loc[bullish_engulfing_mask, 'candlestick_pattern'] = 2
+    
+    # Improved Bearish Engulfing
+    bearish_engulfing_mask = ((data['open'] > data['close']) &  # Current is a bear candle
+                              (data['open'].shift(1) < data['close'].shift(1)) &  # Previous is a bull candle
+                              (data['open'] > data['close'].shift(1)) &  # Current open is higher than previous close
+                              (data['close'] < data['open'].shift(1)))  # Current close is lower than previous open
+    data.loc[bearish_engulfing_mask, 'candlestick_pattern'] = 3
+
+    # Bullish Pin Bar
+    bullish_pin_bar_mask = ((data['close'] > data['open']) &  # Bull candle
+                            ((data['open'] - data['low']) > 2 * (data['close'] - data['open'])) &  # Long lower shadow
+                            ((data['high'] - data['close']) < (data['close'] - data['open'])))  # Small upper shadow
+    data.loc[bullish_pin_bar_mask, 'candlestick_pattern'] = 4
+
+    # Bearish Pin Bar
+    bearish_pin_bar_mask = ((data['close'] < data['open']) &  # Bear candle
+                            ((data['high'] - data['open']) > 2 * (data['open'] - data['close'])) &  # Long upper shadow
+                            ((data['close'] - data['low']) < (data['open'] - data['close'])))  # Small lower shadow
+    data.loc[bearish_pin_bar_mask, 'candlestick_pattern'] = 5
 
     return data
 
@@ -383,7 +418,7 @@ def evaluate(Pair='N/A', timeframe_str='N/A', selector=None):
 
     testing_set = testing_set.reset_index()
 
-    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open']
+    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open', 'tick_volume', 'real_volume']
 
     X_test, y_test, X_test_non_numeric = preprocess_data_no_scale(testing_set, columns_to_drop)
 
@@ -579,7 +614,7 @@ def predict_next_forex(choice):
 
     print(latest_row)
 
-    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open']
+    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open', 'tick_volume', 'real_volume']
 
     # Since this is a prediction for the future, we assume no 'target' available
     # Prepare data (you need to ensure your preprocessing function can handle single row)
@@ -726,7 +761,7 @@ def predict_specific(choice):
         else:
             print("The specified date or datetime is not available in the dataset. Please choose another within the range.")
 
-    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open']
+    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open', 'tick_volume', 'real_volume']
 
     # Since this is a prediction for the future, we assume no 'target' available
     # Prepare data (you need to ensure your preprocessing function can handle single row)
@@ -810,7 +845,7 @@ def training_forex_multiple(choice, Pair, timeframe_str):
     training_set = training_set.reset_index()
     testing_set = testing_set.reset_index()
 
-    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open']
+    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open', 'tick_volume', 'real_volume']
 
     X_train, y_train, _ = preprocess_data_no_scale(training_set, columns_to_drop)
     X_val, y_val, _ = preprocess_data_no_scale(testing_set, columns_to_drop)
@@ -974,7 +1009,7 @@ def training(choice):
     training_set = training_set.reset_index()
     testing_set = testing_set.reset_index()
 
-    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open']
+    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open', 'tick_volume', 'real_volume']
 
     X_train, y_train, _ = preprocess_data_no_scale(training_set, columns_to_drop)
     X_val, y_val, _ = preprocess_data_no_scale(testing_set, columns_to_drop)
