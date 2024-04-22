@@ -8,44 +8,14 @@ import os
 import glob
 import numpy as np
 import pandas as pd
-import torch
-from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import accuracy_score, confusion_matrix
-from sklearn.preprocessing import MinMaxScaler
-from torch.nn import BCELoss
-from torch.optim import Adam
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from sklearn.ensemble import RandomForestClassifier
 import json
 import shutil
 import matplotlib.pyplot as plt
-import joblib
-import torch.nn as nn
-import torch.nn.functional as F
-
-class MLPModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[100, 75, 50, 25], dropout_rates=[0.2, 0.3, 0.4, 0.5], output_size=1):
-        super(MLPModel, self).__init__()
-        # Initialize layers dynamically
-        self.layers = nn.ModuleList()
-        # Construct the hidden layers
-        layer_sizes = [input_size] + hidden_sizes
-        for i in range(len(hidden_sizes)):
-            self.layers.append(nn.Linear(layer_sizes[i], layer_sizes[i+1]))
-            self.layers.append(nn.ReLU())  # Consider using other activations like nn.LeakyReLU() or nn.ELU()
-            self.layers.append(nn.Dropout(dropout_rates[i]))
-        
-        # Output layer
-        self.output_layer = nn.Sequential(
-            nn.Linear(hidden_sizes[-1], output_size),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        x = self.output_layer(x)
-        return x
+import xgboost as xgb
+from sklearn.model_selection import GridSearchCV
+from sklearn.feature_selection import SelectFromModel
+import pickle
 
 def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
 
@@ -200,8 +170,8 @@ def calculate_indicators(data, choice):
 
     data['close_price_previous'] = data['close'].shift(1)
 
-    # Calculate the 'Actual Movement' based on the future price movement
-    data['Actual Movement'] = np.where(data['close_price_next'] > data['close'], 1,
+    # Calculate the 'target' based on the future price movement
+    data['target'] = np.where(data['close_price_next'] > data['close'], 1,
                                        np.where(data['close_price_next'] < data['close'], -1, 0))
 
     # Drop the 'close_price_next' column if you no longer need it
@@ -210,41 +180,55 @@ def calculate_indicators(data, choice):
     data['close_price_percentage_change'] = data['close'].pct_change().fillna(0) * 100
     data['previous_close_price_percentage_change'] = data['close_price_percentage_change'].shift(1)
 
-    data['Actual Movement Previous'] = data['Actual Movement'].shift(1)
-
-    data['day_of_week'] = data.index.dayofweek
-    data['month_of_year'] = data.index.month
+    # Adding lag features for 'target'
+    number_of_lags = 3
+    for lag in range(1, number_of_lags + 1):
+        data[f'Actual Movement Lag_{lag}'] = data['target'].shift(lag)
 
     if choice == '1':
         # Remove the last row of the DataFrame
         data = data.drop(data.tail(1).index)
 
+    horizons = [2, 5, 60, 250, 1000]
+
+    new_predictors = []
+
+    for horizon in horizons:
+        rolling_average = data.rolling(horizon).mean()
+
+        ratio_column = f'Close_Ratio_{horizon}'
+
+        data[ratio_column] = data['close'] / rolling_average['close']
+
+        trend_column = f'Trend_{horizon}'
+
+        data[trend_column] = data.shift(1).rolling(horizon).sum()['target']
+
+        new_predictors += [ratio_column, trend_column]
+
     # Return the data with added indicators
     return data
 
 def calculate_movement(data):
-
+    # Ensure proper column names
     if 'DateTime' in data.columns:
-        # Rename the column
         data.rename(columns={'DateTime': 'time'}, inplace=True)
-    
     if 'Close' in data.columns:
-        # Rename the column
         data.rename(columns={'Close': 'close'}, inplace=True)
 
-    data['close_price_percentage_change'] = data['close'].pct_change().fillna(0) * 100
-    data['close_price_previous_percentage_change'] = data['close_price_percentage_change'].shift(1).fillna(0)
-    # Shift the 'close' column up to get the next 'close' price in the future
+    # Calculate future price movement
     data['close_price_next'] = data['close'].shift(-1)
-
-    # Calculate the 'Actual Movement' based on the future price movement
-    data['Actual Movement'] = np.where(data['close_price_next'] > data['close'], 1,
-                                       np.where(data['close_price_next'] < data['close'], -1, 0))
-
-    # Drop the 'close_price_next' column if you no longer need it
+    data['target'] = np.where(data['close_price_next'] > data['close'], 1,
+                              np.where(data['close_price_next'] < data['close'], -1, 0))
     data.drop(columns=['close_price_next'], inplace=True)
 
-    # Return the data with added indicators
+    # Adding rolling features, ratios, and more complex indicators
+    horizons = [2, 5, 60, 250, 1000]
+    for horizon in horizons:
+        rolling_mean = data['close'].rolling(window=horizon).mean()
+        data[f'Close_Ratio_{horizon}'] = data['close'] / rolling_mean
+        data[f'Trend_{horizon}'] = data['target'].shift(1).rolling(window=horizon).sum()
+
     return data
 
 def split_and_save_dataset(dataset, timeframe='4h', pair='6B'):
@@ -333,35 +317,19 @@ def read_csv_to_dataframe(file_path):
 
     return df
 
-def preprocess_data(data, scaler_path='scaler.pkl'):
-    # Load the pre-fitted scaler
-    scaler = joblib.load(scaler_path)
+def preprocess_data_no_scale(data, columns_to_drop):
     
-    # Assuming 'time' and 'Actual Movement' are non-numeric columns we want to drop for training
-    data_numeric = data.drop(columns=['time', 'Actual Movement']).values
-    
-    # Transform the data using the loaded scaler
-    data_scaled = scaler.transform(data_numeric)
-    
-    # Prepare labels if 'Actual Movement' exists in the data
-    if 'Actual Movement' in data.columns:
-        labels = np.where(data['Actual Movement'].values == -1, 0, 1)
-        return data_scaled, labels
-    
-    return data_scaled
+    # Assuming 'time' and 'target' are non-numeric columns we want to drop for training
+    data_numeric = data.drop(columns=columns_to_drop).values
 
-def fit_and_save_scaler(data):
-    # Drop non-numeric or target columns
-    data_numeric = data.drop(columns=['time', 'Actual Movement']).values
+    data_non_numeric = data.drop(columns=columns_to_drop)
     
-    # Initialize the scaler
-    scaler = MinMaxScaler()
+    # Prepare labels if 'target' exists in the data
+    if 'target' in data.columns:
+        labels = np.where(data['target'].values == -1, 0, 1)
+        return data_numeric, labels, data_non_numeric
     
-    # Fit the scaler on the data
-    scaler.fit(data_numeric)
-    
-    # Save the scaler for later use
-    joblib.dump(scaler, 'scaler.pkl')
+    return data_numeric, data_non_numeric
 
 def find_optimal_threshold_accuracy(y_true, y_probs):
     # Define a range of possible thresholds from 0 to 1 with a small step
@@ -404,7 +372,7 @@ def load_optimal_threshold_json(model_path):
         data = json.load(f)
         return data['optimal_threshold']
 
-def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
+def evaluate(Pair='N/A', timeframe_str='N/A', selector=None):
     # Your existing code
     testing_files = glob.glob('testing*.csv')
     for file in testing_files:
@@ -414,54 +382,76 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
         testing_set.set_index('time', inplace=True)
 
     testing_set = testing_set.reset_index()
-    X_test, y_test = preprocess_data(testing_set)
-    X_test_tensor = torch.FloatTensor(X_test)
-    y_test_tensor = torch.FloatTensor(y_test).unsqueeze(1)  # Adjust shape for BCELoss compatibility
 
-    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-    test_loader = DataLoader(test_dataset, batch_size=16)
+    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open']
 
-    model = MLPModel(input_size=X_test.shape[1])
-    model.load_state_dict(torch.load('mlp_model.pth'))
-    model.eval()
+    X_test, y_test, X_test_non_numeric = preprocess_data_no_scale(testing_set, columns_to_drop)
 
-    predictions, true_labels = [], []
-    with torch.no_grad():
-        for inputs, labels in test_loader:
-            output = model(inputs)
-            predictions.extend(output.view(-1).numpy())
-            true_labels.extend(labels.view(-1).numpy())
+    # Apply the same feature selector to the test data
+    X_test_selected = selector.transform(X_test)
 
-    predictions = np.array(predictions)
-    true_labels = np.array(true_labels)
-    optimal_threshold = find_optimal_threshold_accuracy(true_labels, predictions)
+    # Get the mask of selected features
+    selected_features_mask = selector.get_support()
+
+    # Apply this mask to the columns of the original data (before dropping any columns)
+    selected_feature_names = X_test_non_numeric.columns[selected_features_mask].tolist()
+
+    # Now 'selected_feature_names' contains the names of the features selected by the model
+    # and 'X_test_selected' contains the actual data for those selected features
+
+    dtest = xgb.DMatrix(X_test_selected, label=y_test, feature_names=selected_feature_names)
+
+    # Create a new model object
+    bst_loaded = xgb.Booster()
+
+    # Load the model from the file
+    bst_loaded.load_model('xgboost_model.json')
+
+    # Make predictions (probabilities)
+    preds = bst_loaded.predict(dtest)
+
+    # Find the optimal threshold
+    optimal_threshold = find_optimal_threshold_accuracy(y_test, preds)
+
     save_optimal_threshold_json(optimal_threshold)
-    final_predictions = (predictions >= optimal_threshold).astype(int)
-    adjusted_predictions = np.where(final_predictions == 0, -1, 1)
-    adjusted_true_labels = np.where(true_labels == 0, -1, 1)
 
-    results_df = testing_set[['time', 'Actual Movement', 'close']].reset_index(drop=True)
-    results_df['Predictions'] = predictions
+    # Convert probabilities to final predictions based on the optimal threshold
+    predictions = (preds >= optimal_threshold).astype(int)
+    adjusted_predictions = np.where(predictions == 0, -1, 1)
+
+    # Calculate accuracy with the optimal threshold
+    accuracy = accuracy_score(y_test, predictions)
+    conf_matrix = confusion_matrix(y_test, predictions)
+
+    results_df = testing_set[['time', 'target', 'close']].reset_index(drop=True)
+    results_df['Predictions'] = preds
     results_df['Predicted'] = adjusted_predictions
 
     results_df.to_csv('predicted_classification_with_Actual_Movement_and_close_MLP.csv', index=False)
 
-    accuracy = accuracy_score(adjusted_true_labels, adjusted_predictions)
-    conf_matrix = confusion_matrix(adjusted_true_labels, adjusted_predictions)
+    save_directory = f'agent_forex_{accuracy*100:.2f}%_{Pair}_{timeframe_str}'
+    if not os.path.exists(save_directory):
+        os.makedirs(save_directory)
 
-    if choice == '1':
-        # Directory for saved files
-        save_directory = f'agent_forex_{accuracy*100:.2f}%_{Pair}_{timeframe_str}'
-        if not os.path.exists(save_directory):
-            os.makedirs(save_directory)
-    elif choice == '2':
-        # Directory for saved files
-        save_directory = f'agent_futures_{accuracy*100:.2f}%_{Pair}_{timeframe_str}'
-        if not os.path.exists(save_directory):
-            os.makedirs(save_directory)
+    # Calculate metrics
+    TP = conf_matrix[1, 1]
+    TN = conf_matrix[0, 0]
+    FP = conf_matrix[0, 1]
+    FN = conf_matrix[1, 0]
 
-    # Plotting the confusion matrix
-    fig, ax = plt.subplots()
+    # Accuracy: (TP + TN) / (TP + TN + FP + FN)
+    accuracy = (TP + TN) / np.sum(conf_matrix)
+
+    # Precision: TP / (TP + FP)
+    precision = TP / (TP + FP)
+
+    # Recall: TP / (TP + FN)
+    recall = TP / (TP + FN)
+
+    # Specificity: TN / (TN + FP)
+    specificity = TN / (TN + FP)
+
+    fig, ax = plt.subplots(figsize=(8, 6))  # Larger figure size
     cax = ax.matshow(conf_matrix, cmap=plt.cm.Blues)
     fig.colorbar(cax)
 
@@ -476,13 +466,20 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
     for (i, j), val in np.ndenumerate(conf_matrix):
         ax.text(j, i, f'{val}', ha='center', va='center', color='black')
 
+    # Accuracy (How often the model is correct)
+    # Precision (When it predicts yes, how often is it correct?)
+    # Recall or Sensitivity (How often it correctly predicts yes when it is actually yes)
+    # Specificity (How often it correctly predicts no when it is actually no)
+
+    # Include metrics in the title, properly formatted as percentages
     plt.xlabel('Predicted labels')
     plt.ylabel('True labels')
-    plt.title('Confusion Matrix')
+    plt.title('Confusion Matrix\n'
+            f'Accuracy: {accuracy*100:.2f}%, Precision: {precision*100:.2f}%, Recall or Sensitivity: {recall*100:.2f}%, Specificity: {specificity*100:.2f}%')
     plt.savefig('confusion_matrix.png')  # Save to the file system of this environment
-
     # Save all files except the specified ones
-    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'RFT.py']
+    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'XGboost.py']
+
     for file in os.listdir('.'):
         if file not in exclude_files and os.path.isfile(file):
             shutil.move(file, os.path.join(save_directory, file))
@@ -493,7 +490,7 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
 
 def get_model_path(folder_name):
     # Construct the path to the model file within the specified folder
-    model_path = os.path.join(folder_name, 'mlp_model.pth')
+    model_path = os.path.join(folder_name, 'xgboost_model.json')
 
     print(model_path)
     
@@ -501,66 +498,6 @@ def get_model_path(folder_name):
         raise FileNotFoundError(f"Model file not found in directory {folder_name}")
     
     return model_path
-
-def get_scaler_path(folder_name):
-    # Construct the path to the model file within the specified folder
-    scaler_path = os.path.join(folder_name, 'scaler.pkl')
-    
-    if not os.path.exists(scaler_path):
-        raise FileNotFoundError(f"Model file not found in directory {folder_name}")
-    
-    return scaler_path
-
-def predict_next_futures():
-
-    # Load the latest chart data
-    dataset = read_csv_to_dataframe('Chart_Latest.csv')
-
-    # Calculate movement for the dataset
-    calculate_movement(dataset)
-
-    # Select the last five rows but remove the very last one
-    last_five_rows = dataset.tail(5).drop(dataset.tail(1).index)
-
-    # Select only the last row (latest data point)
-    latest_row = last_five_rows.tail(1)
-
-    latest_row = latest_row.reset_index()
-
-    print(latest_row)
-
-    # Since this is a prediction for the future, we assume no 'Actual Movement' available
-    # Prepare data (you need to ensure your preprocessing function can handle single row)
-    X, _ = preprocess_data(latest_row)
-
-    # Convert to PyTorch tensors
-    X_tensor = torch.FloatTensor(X)
-
-    # Load the model (ensure it's already trained and the state dict is available)
-    model = MLPModel(input_size=X.shape[1])
-    model_path = get_model_path(base_dir='agent_futures')  # Optionally pass accuracy if known
-    model.load_state_dict(torch.load(model_path))
-    model.eval()
-
-    # Make predictions
-    with torch.no_grad():
-        output = model(X_tensor)
-    
-    print(output)
-
-    # Load the optimal threshold (make sure you have this value saved from your training phase)
-    optimal_threshold = load_optimal_threshold_json(model_path)  # Implement this function to read the saved threshold
-
-    # Use the threshold to determine the predicted class
-    predicted_class = (output >= optimal_threshold).float()
-
-    # Convert the tensor to a numpy array for easier handling if necessary
-    predicted_movement = np.where(predicted_class.numpy().flatten() == 0, -1, 1)[0]  # [0] to get a single value
-
-    print(f'Predicted Movement is {predicted_movement}')
-
-    # Optionally, return the prediction or handle it as needed
-    return predicted_movement
 
 def find_recent_forex_agent_dir(pair='EURUSD', timeframe='DAILY', base_dir=None):
     # Use the current working directory if no base_dir is provided
@@ -629,6 +566,8 @@ def predict_next_forex(choice):
     # Apply technical indicators to the data using the 'calculate_indicators' function
     eur_usd_data = calculate_indicators(eur_usd_data, choice) 
 
+    #calculate_movement(eur_usd_data)
+
     # Drop rows where any of the data is missing
     eur_usd_data = eur_usd_data.dropna()
 
@@ -640,42 +579,59 @@ def predict_next_forex(choice):
 
     print(latest_row)
 
-    scaler_path = get_scaler_path(folder_name)
+    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open']
 
-    # Since this is a prediction for the future, we assume no 'Actual Movement' available
+    # Since this is a prediction for the future, we assume no 'target' available
     # Prepare data (you need to ensure your preprocessing function can handle single row)
-    X, _ = preprocess_data(latest_row, scaler_path)
+    X, _, X_non_numeric = preprocess_data_no_scale(latest_row, columns_to_drop)
 
-    # Convert to PyTorch tensors
-    X_tensor = torch.FloatTensor(X)
+    # Create the full file path
+    file_path = os.path.join(folder_name, 'selector.pkl')
 
-    # Load the model (ensure it's already trained and the state dict is available)
-    model = MLPModel(input_size=X.shape[1])
+    # Load the selector from the specified folder
+    with open(file_path, 'rb') as file:
+        loaded_selector = pickle.load(file)
+
+    # Apply the same feature selector to the test data
+    X_selected = loaded_selector.transform(X)
+
+    # Get the mask of selected features
+    selected_features_mask = loaded_selector.get_support()
+
+    # Apply this mask to the columns of the original data (before dropping any columns)
+    selected_feature_names = X_non_numeric.columns[selected_features_mask].tolist()
+
+    # Convert to DMatrix
+    dtest_single = xgb.DMatrix(X_selected, _, feature_names=selected_feature_names)
+
+    # Create a new model object
+    bst_loaded = xgb.Booster()
+
     model_path = get_model_path(folder_name)
-    model.load_state_dict(torch.load(model_path))
-    model.eval()
 
-    # Make predictions
-    with torch.no_grad():
-        output = model(X_tensor)
-    
+    # Load the model from the file
+    bst_loaded.load_model(model_path)
+
+    # Make predictions (probabilities)
+    pred = bst_loaded.predict(dtest_single)
+
     # Load the optimal threshold (make sure you have this value saved from your training phase)
     optimal_threshold = load_optimal_threshold_json(model_path)  # Implement this function to read the saved threshold
 
     # Use the threshold to determine the predicted class
-    predicted_class = (output >= optimal_threshold).float()
+    predicted_class = (pred >= optimal_threshold)
 
-    print(f'Output: {output}, Optimal Threshold: {optimal_threshold}')
+    print(f'Output: {pred}, Optimal Threshold: {optimal_threshold}')
 
     # Convert the tensor to a numpy array for easier handling if necessary
-    predicted_movement = np.where(predicted_class.numpy().flatten() == 0, -1, 1)[0]  # [0] to get a single value
+    adjusted_prediction = np.where(predicted_class == 0, -1, 1)
 
-    print(f'Predicted Movement is {predicted_movement}')
+    print(f'Predicted Movement is {adjusted_prediction}')
 
     # Extract necessary information from the latest row
     time = latest_row['time'].iloc[0]
     close = latest_row['close'].iloc[0]
-    predicted = predicted_movement
+    predicted = adjusted_prediction
 
     # Prepare the data dictionary
     data = {
@@ -700,7 +656,7 @@ def predict_next_forex(choice):
         print(f"Data appended to: {csv_file_path}")
 
     # Optionally, return the prediction or handle it as needed
-    return predicted_movement
+    return adjusted_prediction
 
 def try_parse_datetime(input_str):
     try:
@@ -741,7 +697,9 @@ def predict_specific(choice):
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
     # Apply technical indicators to the data using the 'calculate_indicators' function
-    eur_usd_data = calculate_indicators(eur_usd_data, choice) 
+    #eur_usd_data = calculate_indicators(eur_usd_data, choice) 
+
+    calculate_movement(eur_usd_data)
 
     # Filter the EUR/USD data for the in-sample training period
     dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
@@ -767,142 +725,160 @@ def predict_specific(choice):
             print(specific_row)
         else:
             print("The specified date or datetime is not available in the dataset. Please choose another within the range.")
-        scaler_path = get_scaler_path(folder_name)
 
-    # Since this is a prediction for the future, we assume no 'Actual Movement' available
+    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open']
+
+    # Since this is a prediction for the future, we assume no 'target' available
     # Prepare data (you need to ensure your preprocessing function can handle single row)
-    X, _ = preprocess_data(specific_row, scaler_path)
+    X, _, X_non_numeric = preprocess_data_no_scale(specific_row, columns_to_drop)
 
-    # Convert to PyTorch tensors
-    X_tensor = torch.FloatTensor(X)
+    # Create the full file path
+    file_path = os.path.join(folder_name, 'selector.pkl')
 
-    # Load the model (ensure it's already trained and the state dict is available)
-    model = MLPModel(input_size=X.shape[1])
+    # Load the selector from the specified folder
+    with open(file_path, 'rb') as file:
+        loaded_selector = pickle.load(file)
+
+    # Apply the same feature selector to the test data
+    X_selected = loaded_selector.transform(X)
+
+    # Get the mask of selected features
+    selected_features_mask = loaded_selector.get_support()
+
+    # Apply this mask to the columns of the original data (before dropping any columns)
+    selected_feature_names = X_non_numeric.columns[selected_features_mask].tolist()
+
+    # Convert to DMatrix
+    dtest_single = xgb.DMatrix(X_selected, _, feature_names=selected_feature_names)
+
+    # Create a new model object
+    bst_loaded = xgb.Booster()
+
     model_path = get_model_path(folder_name)
-    model.load_state_dict(torch.load(model_path))
-    model.eval()
 
-    # Make predictions
-    with torch.no_grad():
-        output = model(X_tensor)
-    
+    # Load the model from the file
+    bst_loaded.load_model(model_path)
+
+    # Make predictions (probabilities)
+    pred = bst_loaded.predict(dtest_single)
+
     # Load the optimal threshold (make sure you have this value saved from your training phase)
     optimal_threshold = load_optimal_threshold_json(model_path)  # Implement this function to read the saved threshold
 
     # Use the threshold to determine the predicted class
-    predicted_class = (output >= optimal_threshold).float()
+    predicted_class = (pred >= optimal_threshold)
 
-    print(f'Output: {output}, Optimal Threshold: {optimal_threshold}')
+    print(f'Output: {pred}, Optimal Threshold: {optimal_threshold}')
 
     # Convert the tensor to a numpy array for easier handling if necessary
-    predicted_movement = np.where(predicted_class.numpy().flatten() == 0, -1, 1)[0]  # [0] to get a single value
+    adjusted_prediction = np.where(predicted_class == 0, -1, 1)
 
-    print(f'Predicted Movement is {predicted_movement}')
+    print(f'Predicted Movement is {adjusted_prediction}')
 
 def training_forex_multiple(choice, Pair, timeframe_str):
+    # Retrieve and store the current date
     current_date = str(datetime.now().date())
+
+    # Hardcoded start date for strategy evaluation
     strategy_start_date_all = "1971-01-04"
+    # Use the current date as the end date for strategy evaluation
     strategy_end_date_all = current_date
 
+    # Convert string representation of dates to datetime objects for further processing
     start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
     end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
 
     training_start_date = "2000-01-01"
     training_end_date = current_date
 
+    # Fetch and prepare the FX data for the specified currency pair and timeframe
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
-    eur_usd_data = calculate_indicators(eur_usd_data, choice)
+
+    # Apply technical indicators to the data using the 'calculate_indicators' function
+    #eur_usd_data = calculate_indicators(eur_usd_data, choice)
+
+    calculate_movement(eur_usd_data)
+
+    # Filter the EUR/USD data for the in-sample training period
     dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
+
+    # Drop rows where any of the data is missing
     dataset = dataset.dropna()
 
     training_set, testing_set = split_and_save_dataset(dataset, timeframe_str, Pair)
 
-    batch_size=16
-
     training_set = training_set.reset_index()
     testing_set = testing_set.reset_index()
 
-    fit_and_save_scaler(training_set)
+    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open']
 
-    X_train, y_train = preprocess_data(training_set)
-    X_test, y_test = preprocess_data(testing_set)
+    X_train, y_train, _ = preprocess_data_no_scale(training_set, columns_to_drop)
+    X_val, y_val, _ = preprocess_data_no_scale(testing_set, columns_to_drop)
 
-    # Convert to PyTorch tensors
-    X_train_tensor = torch.FloatTensor(X_train)
-    y_train_tensor = torch.FloatTensor(y_train).unsqueeze(1)  # BCELoss expects the same shape for input and target
-    X_test_tensor = torch.FloatTensor(X_test)
-    y_test_tensor = torch.FloatTensor(y_test).unsqueeze(1)
+    feature_coloumns = testing_set.drop(columns=columns_to_drop).columns.tolist()
+    
+    dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_coloumns)
+    dval = xgb.DMatrix(X_val, label=y_val, feature_names=feature_coloumns)
+    
+    # Define the model
+    model = xgb.XGBClassifier(objective='binary:logistic', eval_metric='logloss', early_stopping_rounds=50)
 
-    # Create DataLoader instances
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    # Define the grid of parameters to search
+    param_grid = {
+        'max_depth': [3, 5, 7, 9],
+        'min_child_weight': [1, 2, 5, 10],
+        'learning_rate': [0.01, 0.1, 0.3],  # 'eta' in xgb.train corresponds to 'learning_rate' in XGBClassifier
+    }
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size)
-    val_loader = DataLoader(test_dataset, batch_size=batch_size)
+    # Setup the grid search
+    grid_search = GridSearchCV(estimator=model, param_grid=param_grid, scoring='accuracy', cv=3, verbose=1)
 
-    model = MLPModel(input_size=X_train.shape[1])
-    loss_function = BCELoss()
-    optimizer = Adam(model.parameters(), lr=0.001, weight_decay=0.01)  # Adding weight decay for L2 regularization
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+    # Convert DMatrix to NumPy arrays (if using DMatrix objects)
+    X_train_numpy, y_train_numpy = dtrain.get_data(), dtrain.get_label()
+    X_val_numpy, y_val_numpy = dval.get_data(), dval.get_label()
 
-    epochs = 100  # Adjust number of epochs based on your dataset and early stopping criteria
+    # Fit grid search to the data
+    best_model = grid_search.fit(X_train_numpy, y_train_numpy, eval_set=[(X_val_numpy, y_val_numpy)], verbose=True)
 
-    # For storing metrics
-    train_losses = []
-    val_losses = []
+    # Retrain using the best parameters found
+    bst = xgb.XGBClassifier(**best_model.best_params_, objective='binary:logistic', eval_metric='logloss')
+    bst.fit(X_train_numpy, y_train_numpy, eval_set=[(X_val_numpy, y_val_numpy)], verbose=True)
 
-    patience = 20
-    min_delta = 0.01
-    best_val_loss = float('inf')
-    no_improvement_count = 0
+    # Save the model
+    bst.save_model('xgboost_model.json')
 
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0
-        for inputs, labels in train_loader:
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = loss_function(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+    # Use SelectFromModel to select features based on importance
+    selector = SelectFromModel(estimator=bst, threshold='mean', prefit=True)
 
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                outputs = model(inputs)
-                loss = loss_function(outputs, labels)
-                val_loss += loss.item()
+    with open('selector.pkl', 'wb') as file:
+        pickle.dump(selector, file)
 
-        train_loss /= len(train_loader)
-        val_loss /= len(val_loader)
+    # Get feature importance
+    importance = bst.feature_importances_
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
+    # Convert importance scores and feature names into a DataFrame
+    importance_df = pd.DataFrame({
+        'Feature': feature_coloumns,
+        'Importance': importance
+    })
 
-        print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+    # Sort the DataFrame by importance scores
+    importance_df = importance_df.sort_values(by='Importance', ascending=False)
 
-        scheduler.step(val_loss)  # Adjust learning rate based on the validation loss
+    # Plotting feature importance
+    plt.figure(figsize=(12, 8))
+    plt.barh(importance_df['Feature'], importance_df['Importance'])
+    plt.xlabel('Importance')
+    plt.title('Feature Importance')
+    plt.gca().invert_yaxis()  # Invert y axis to have the most important at the top
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            no_improvement_count = 0
-            torch.save(model.state_dict(), 'mlp_model.pth')
-            print("Validation loss decreased, saving model...")
-        else:
-            no_improvement_count += 1
-            print(f"No improvement in validation loss for {no_improvement_count} epochs")
-            if no_improvement_count >= patience:
-                print("Early stopping triggered")
-                break
+    # Optionally, you can also save this plot to a file
+    plt.savefig('Feature_Importance.png')  # Save to the file system of this environment
 
-    print("Training completed. Best model saved as 'mlp_model.pth'.")
-
-    evaluate(choice, Pair, timeframe_str)
+    evaluate(Pair, timeframe_str, selector)
 
     backtest_trades_with_dataframe(choice, timeframe_str, Pair)
-
+    
 def fetch_forex_pairs():
     account_number = 530064788
     password = 'fe5@6YV*'
@@ -956,146 +932,126 @@ def main_training_loop_multiple_pairs():
         training_forex_multiple(choice, pair, timeframe)
 
 def training(choice):
-    if choice == '1':
-        # Retrieve and store the current date
-        current_date = str(datetime.now().date())
+    # Retrieve and store the current date
+    current_date = str(datetime.now().date())
 
-        # Hardcoded start date for strategy evaluation
-        strategy_start_date_all = "1971-01-04"
-        # Use the current date as the end date for strategy evaluation
-        strategy_end_date_all = current_date
+    # Hardcoded start date for strategy evaluation
+    strategy_start_date_all = "1971-01-04"
+    # Use the current date as the end date for strategy evaluation
+    strategy_end_date_all = current_date
 
-        # Convert string representation of dates to datetime objects for further processing
-        start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
-        end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
+    # Convert string representation of dates to datetime objects for further processing
+    start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
+    end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
 
-        # Prompt the user to decide if they want real-time data updates and store the boolean result
-        #enable_real_time = input("Do you want to enable real-time data updates? (yes/no): ").lower().strip() == 'yes'
+    # Prompt the user to decide if they want real-time data updates and store the boolean result
+    #enable_real_time = input("Do you want to enable real-time data updates? (yes/no): ").lower().strip() == 'yes'
 
-        # Prompt the user for the desired timeframe for analysis and standardize the input
-        timeframe_str = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
-        # Prompt the user for the currency pair they're interested in and standardize the input
-        Pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
+    # Prompt the user for the desired timeframe for analysis and standardize the input
+    timeframe_str = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
+    # Prompt the user for the currency pair they're interested in and standardize the input
+    Pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
 
-        training_start_date = "2000-01-01"
-        training_end_date = current_date
+    training_start_date = "2000-01-01"
+    training_end_date = current_date
 
-        # Fetch and prepare the FX data for the specified currency pair and timeframe
-        eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
+    # Fetch and prepare the FX data for the specified currency pair and timeframe
+    eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
-        # Apply technical indicators to the data using the 'calculate_indicators' function
-        eur_usd_data = calculate_indicators(eur_usd_data, choice)
+    # Apply technical indicators to the data using the 'calculate_indicators' function
+    #eur_usd_data = calculate_indicators(eur_usd_data, choice)
 
-        # Filter the EUR/USD data for the in-sample training period
-        dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
+    calculate_movement(eur_usd_data)
 
-        # Drop rows where any of the data is missing
-        dataset = dataset.dropna()
-    
-        training_set, testing_set = split_and_save_dataset(dataset, timeframe_str, Pair)
-    elif choice == '2':
-        dataset = read_csv_to_dataframe('Chart_1h.csv')
+    # Filter the EUR/USD data for the in-sample training period
+    dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
 
-        Pair = '6B'
+    # Drop rows where any of the data is missing
+    dataset = dataset.dropna()
 
-        timeframe_str = '1H'
-
-        # Remove the last row of the DataFrame
-        dataset = dataset.drop(dataset.tail(1).index)
-
-        calculate_movement(dataset)
-
-        training_set, testing_set = split_and_save_dataset(dataset, timeframe_str, Pair)    
-
-    batch_size=16
+    training_set, testing_set = split_and_save_dataset(dataset, timeframe_str, Pair)
 
     training_set = training_set.reset_index()
     testing_set = testing_set.reset_index()
 
-    fit_and_save_scaler(training_set)
+    columns_to_drop = ['time', 'target', 'spread', 'low', 'close', 'high', 'open']
 
-    X_train, y_train = preprocess_data(training_set)
-    X_test, y_test = preprocess_data(testing_set)
+    X_train, y_train, _ = preprocess_data_no_scale(training_set, columns_to_drop)
+    X_val, y_val, _ = preprocess_data_no_scale(testing_set, columns_to_drop)
 
-    # Convert to PyTorch tensors
-    X_train_tensor = torch.FloatTensor(X_train)
-    y_train_tensor = torch.FloatTensor(y_train).unsqueeze(1)  # BCELoss expects the same shape for input and target
-    X_test_tensor = torch.FloatTensor(X_test)
-    y_test_tensor = torch.FloatTensor(y_test).unsqueeze(1)
+    feature_coloumns = testing_set.drop(columns=columns_to_drop).columns.tolist()
+    
+    dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_coloumns)
+    dval = xgb.DMatrix(X_val, label=y_val, feature_names=feature_coloumns)
+    
+    # Define the model
+    model = xgb.XGBClassifier(objective='binary:logistic', eval_metric='logloss', early_stopping_rounds=50)
 
-    # Create DataLoader instances
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    # Define the grid of parameters to search
+    param_grid = {
+        'max_depth': [3, 5, 7, 9],
+        'min_child_weight': [1, 2, 5, 10],
+        'learning_rate': [0.01, 0.1, 0.3],  # 'eta' in xgb.train corresponds to 'learning_rate' in XGBClassifier
+    }
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size)
-    val_loader = DataLoader(test_dataset, batch_size=batch_size)
+    # Setup the grid search
+    grid_search = GridSearchCV(estimator=model, param_grid=param_grid, scoring='accuracy', cv=3, verbose=1)
 
-    model = MLPModel(input_size=X_train.shape[1])
-    loss_function = BCELoss()
-    optimizer = Adam(model.parameters(), lr=0.001, weight_decay=0.01)  # Adding weight decay for L2 regularization
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+    # Convert DMatrix to NumPy arrays (if using DMatrix objects)
+    X_train_numpy, y_train_numpy = dtrain.get_data(), dtrain.get_label()
+    X_val_numpy, y_val_numpy = dval.get_data(), dval.get_label()
 
-    epochs = 100  # Adjust number of epochs based on your dataset and early stopping criteria
+    # Fit grid search to the data
+    best_model = grid_search.fit(X_train_numpy, y_train_numpy, eval_set=[(X_val_numpy, y_val_numpy)], verbose=True)
 
-    # For storing metrics
-    train_losses = []
-    val_losses = []
+    # Retrain using the best parameters found
+    bst = xgb.XGBClassifier(**best_model.best_params_, objective='binary:logistic', eval_metric='logloss')
+    bst.fit(X_train_numpy, y_train_numpy, eval_set=[(X_val_numpy, y_val_numpy)], verbose=True)
 
-    patience = 20
-    min_delta = 0.01
-    best_val_loss = float('inf')
-    no_improvement_count = 0
+    # Save the model
+    bst.save_model('xgboost_model.json')
 
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0
-        for inputs, labels in train_loader:
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = loss_function(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+    # Get feature importance
+    importance = bst.feature_importances_
 
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                outputs = model(inputs)
-                loss = loss_function(outputs, labels)
-                val_loss += loss.item()
+    # Use SelectFromModel to select features based on importance
+    selector = SelectFromModel(estimator=bst, threshold='mean', prefit=True)
 
-        train_loss /= len(train_loader)
-        val_loss /= len(val_loader)
+    with open('selector.pkl', 'wb') as file:
+        pickle.dump(selector, file)
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
+    """
+    with open('selector.pkl', 'rb') as file:
+    loaded_selector = pickle.load(file)
+    """
 
-        print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+    # Convert importance scores and feature names into a DataFrame
+    importance_df = pd.DataFrame({
+        'Feature': feature_coloumns,
+        'Importance': importance
+    })
 
-        scheduler.step(val_loss)  # Adjust learning rate based on the validation loss
+    # Sort the DataFrame by importance scores
+    importance_df = importance_df.sort_values(by='Importance', ascending=False)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            no_improvement_count = 0
-            torch.save(model.state_dict(), 'mlp_model.pth')
-            print("Validation loss decreased, saving model...")
-        else:
-            no_improvement_count += 1
-            print(f"No improvement in validation loss for {no_improvement_count} epochs")
-            if no_improvement_count >= patience:
-                print("Early stopping triggered")
-                break
+    # Plotting feature importance
+    plt.figure(figsize=(12, 8))
+    plt.barh(importance_df['Feature'], importance_df['Importance'])
+    plt.xlabel('Importance')
+    plt.title('Feature Importance')
+    plt.gca().invert_yaxis()  # Invert y axis to have the most important at the top
 
-    print("Training completed. Best model saved as 'mlp_model.pth'.")
+    # Optionally, you can also save this plot to a file
+    plt.savefig('Feature_Importance.png')  # Save to the file system of this environment
 
-    evaluate(choice, Pair, timeframe_str)
+    evaluate(Pair, timeframe_str, selector)
 
     backtest_trades_with_dataframe(choice, timeframe_str, Pair)
-
+    
 class ForexTradingSimulator:
     def __init__(self, initial_balance, leverage, transaction_cost, lot_size):
         self.current_balance = initial_balance
+        self.initial_balance = initial_balance
         self.leverage = leverage
         self.transaction_cost = transaction_cost
         self.lot_size = lot_size
@@ -1103,6 +1059,13 @@ class ForexTradingSimulator:
         self.position = 'neutral'
         self.entry_price = None
         self.is_open_position = False
+        self.worst_case_pnl = 0
+        self.best_case_pnl = 0
+        self.worst_balance = 0
+        self.last_processed_date = None  # Keep track of the last processed date
+        self.daily_worst_pnl = 0  # Initialize daily profit and loss
+        self.daily_best_pnl = 0 
+
 
     def open_position(self, current_price, position_type, time):
         if not self.is_open_position:
@@ -1113,21 +1076,26 @@ class ForexTradingSimulator:
             self.is_open_position = True
 
             # Log the trade
-            self.log_trade('open', current_price, time)
+            self.log_trade('open', current_price, time,)
 
-    def close_position(self, current_price, time):
-        if self.is_open_position:
-            if self.position == 'long':
-                profit = (current_price - self.entry_price) * self.lot_size
-            elif self.position == 'short':
-                profit = (self.entry_price - current_price) * self.lot_size
+    def close_position(self, current_price=None, time=None, profit=None):
+        if current_price != None:
+            if self.is_open_position:
+                if self.position == 'long':
+                    profit = (current_price - self.entry_price) * self.lot_size
+                elif self.position == 'short':
+                    profit = (self.entry_price - current_price) * self.lot_size
 
+                self.current_balance += profit - self.transaction_cost
+                self.is_open_position = False
+                self.position = 'neutral'
+        else:
             self.current_balance += profit - self.transaction_cost
             self.is_open_position = False
             self.position = 'neutral'
 
-            # Log the trade
-            self.log_trade('close', current_price, time , profit)
+        # Log the trade
+        self.log_trade('close', current_price, time , profit)
 
     def log_trade(self, action, price, time, profit=None):
         self.trade_history.append({
@@ -1137,26 +1105,77 @@ class ForexTradingSimulator:
             'entry_price': self.entry_price if action == 'open' else None,
             'close_price': price if action == 'close' else None,
             'profit': profit,
-            'balance': self.current_balance
+            'balance': self.current_balance,
+            'worst_daily_pnl': self.daily_worst_pnl,
+            'best_daily_pnl': self.daily_best_pnl
         })
+
+    def update_current_pnl(self, high_price, low_price):
+        if self.position == 'long':
+            # Worst-case loss for a long position at the lowest price
+            self.worst_case_pnl = (low_price - self.entry_price) * self.lot_size - self.transaction_cost
+            # Best-case profit for a long position at the highest price
+            self.best_case_pnl = (high_price - self.entry_price) * self.lot_size - self.transaction_cost
+        elif self.position == 'short':
+            # Worst-case loss for a short position at the highest price
+            self.worst_case_pnl = (self.entry_price - high_price) * self.lot_size - self.transaction_cost
+            # Best-case profit for a short position at the lowest price
+            self.best_case_pnl = (self.entry_price - low_price) * self.lot_size - self.transaction_cost
+        else:
+            # If there is no open position, set both PnLs to 0
+            self.worst_case_pnl = 0
+            self.best_case_pnl = 0
 
     def simulate_trading(self, data):
         for _, row in data.iterrows():
-            # Check if there is a change in predicted movement
-            if row['Predicted'] == 1:
-                if not self.is_open_position or self.position == 'short':
-                    if self.is_open_position:  # Close the current short position before opening a new long position
-                        self.close_position(row['close'], row['time'])
-                    self.open_position(row['close'], 'long', row['time'])
-            elif row['Predicted'] == -1:
-                if not self.is_open_position or self.position == 'long':
-                    if self.is_open_position:  # Close the current long position before opening a new short position
-                        self.close_position(row['close'], row['time'])
-                    self.open_position(row['close'], 'short', row['time'])
+            self.update_current_pnl(row['high'], row['low'])
 
-        # Optionally, close any open position at the end of the data
-        if self.is_open_position:
-            self.close_position(data.iloc[-1]['close'], data.iloc[-1]['time'])
+            current_date = row['time'].date()
+
+            # Check for date change
+            if self.last_processed_date is None or self.last_processed_date != current_date:
+                # Reset daily P&L if it's a new day
+                if self.last_processed_date is not None:  # Ensure it's not the first step
+                    self.daily_worst_pnl = 0
+                    self.daily_best_pnl = 0
+
+            # Update last processed date
+            self.last_processed_date = current_date
+
+            self.daily_worst_pnl += self.worst_case_pnl
+
+            self.daily_best_pnl += self.best_case_pnl
+
+            # Check profit and close the trade if profit/loss threshold is crossed
+            if self.is_open_position:
+                # Determine closing logic based on position type
+                if self.position == 'long':
+                    # Close long position at the highest price if profit is good or at the lowest if loss is too high
+                    if self.best_case_pnl >= 100:
+                        self.close_position(None, row['time'], profit=100)  # Close at high for maximum profit
+                    elif self.worst_case_pnl <= -100:
+                        self.close_position(None, row['time'], profit=-100)  # Close at low to stop further loss
+                elif self.position == 'short':
+                    # Close short position at the lowest price if profit is good or at the highest if loss is too high
+                    if self.best_case_pnl >= 100:
+                        self.close_position(None, row['time'],  profit=100)  # Close at low for maximum profit
+                    elif self.worst_case_pnl <= -100:
+                        self.close_position(None, row['time'], profit=-100)  # Close at high to stop further loss
+
+            # Check if there is a change in predicted movement
+            if row['Predicted'] == 1 and (not self.is_open_position or self.position == 'short'):
+                # Close the current short position before opening a new long position
+                if self.is_open_position: 
+                    self.close_position(row['close'], row['time'])
+                self.open_position(row['close'], 'long', row['time'])
+            elif row['Predicted'] == -1 and (not self.is_open_position or self.position == 'long'):
+                # Close the current long position before opening a new short position
+                if self.is_open_position: 
+                    self.close_position(row['close'], row['time'])
+                self.open_position(row['close'], 'short', row['time'])
+            # Log the trade as hold if there is no change in position
+            elif self.is_open_position:
+                self.log_trade('hold', row['close'], row['time'])
 
     def plot_balance_over_time(self, folder_name):
         # Create a DataFrame from the trade history
@@ -1198,8 +1217,8 @@ def backtest_trades_with_dataframe(choice, timeframe_new=None, pair_new=None):
 
     data = predictions_df.merge(prices_df, left_index=True, right_index=True, how='left')
 
-    data.drop(columns=['Actual Movement_y'], inplace=True)
-    data.rename(columns={'Actual Movement_x': 'Actual Movement'}, inplace=True)
+    data.drop(columns=['target_y'], inplace=True)
+    data.rename(columns={'target_x': 'target'}, inplace=True)
 
     data.drop(columns=['time_x'], inplace=True)
     data.rename(columns={'time_y': 'time'}, inplace=True)
@@ -1213,7 +1232,7 @@ def backtest_trades_with_dataframe(choice, timeframe_new=None, pair_new=None):
     data['close_price_next'] = data['close'].shift(-1)
 
     # Define the columns to keep
-    columns_to_keep = ['time', 'Actual Movement', 'Predictions', 'Predicted', 'close', 'close_price_next']
+    columns_to_keep = ['time', 'target', 'Predictions', 'Predicted', 'close', 'close_price_next', 'high', 'low']
 
     # Select these columns in the DataFrame
     data = data[columns_to_keep]
@@ -1245,6 +1264,8 @@ def backtest_trades_with_dataframe(choice, timeframe_new=None, pair_new=None):
     data_csv_filename = os.path.join(folder_name, 'data_backtest.csv')
     data.to_csv(data_csv_filename)
 
+    perform_analysis(choice)
+
 def train_magnitude(choice):
     timeframe = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
 
@@ -1273,9 +1294,9 @@ def train_magnitude(choice):
         # Reset index (if needed)
         df = df.reset_index(drop=True)
         
-        # Drop 'Actual Movement' column, if it exists
-        if 'Actual Movement' in df.columns:
-            df.drop(columns=['Actual Movement'], inplace=True)
+        # Drop 'target' column, if it exists
+        if 'target' in df.columns:
+            df.drop(columns=['target'], inplace=True)
         
         # Calculate the absolute percentage change in the 'close' price from the previous day
         df['close_price_percentage_change'] = df['close'].pct_change().abs()
@@ -1345,12 +1366,21 @@ def analyze_combined_data(combined_df):
     # Group by 'time' and calculate sum of 'profit' for each day
     daily_profit = combined_df.groupby('time')['profit'].sum()
 
+    worst_daily_pnl = combined_df.groupby('time')['worst_daily_pnl'].sum()
+
+    highest_daily_loss = worst_daily_pnl.min()
+
+    print(highest_daily_loss)
+
     # Initial settings
     initial_balance = 10000
     upper_reset_threshold = 11000
     lower_reset_threshold = 9000
     upper_reset_count = 0
     lower_reset_count = 0
+
+    daily_max_loss_reset_threshold = 9500
+    daily_max_loss_count = 0
 
     # Prepare cumulative balance calculation with reset logic
     balances = [initial_balance]
@@ -1365,6 +1395,16 @@ def analyze_combined_data(combined_df):
         else:
             balances.append(new_balance)
 
+    balances_2 = [initial_balance]
+
+    for worst_daily in worst_daily_pnl:
+        new_balance = balances_2[-1] + worst_daily
+        if new_balance <= daily_max_loss_reset_threshold:
+            balances_2.append(initial_balance)
+            daily_max_loss_count += 1
+        else:
+            balances_2.append(new_balance)
+
     # Starting balance
     initial_balance_graph = 10000
 
@@ -1374,19 +1414,14 @@ def analyze_combined_data(combined_df):
     # Sum of daily profits
     total_profit = daily_profit.sum()
     print(f"Total Cumulative Profit: {total_profit}")
-
-    # Calculate the probability of reaching £11,000 before £9,000
-    total_resets = upper_reset_count + lower_reset_count
+    
+    total_resets = upper_reset_count + lower_reset_count + daily_max_loss_count
     if total_resets > 0:
-        probability_of_upper = (upper_reset_count / total_resets) * 100
+        probability_of_passing = (upper_reset_count / total_resets) * 100
     else:
-        probability_of_upper = 0
+        probability_of_passing = 0  # Set probability to 0 (or another appropriate value) when no resets have occurred
 
-    # Print the total number of resets
-    print(f"Total number of upper resets (balance >= {upper_reset_threshold}): {upper_reset_count}")
-    print(f"Total number of lower resets (balance <= {lower_reset_threshold}): {lower_reset_count}")
-
-    print(f"Probability of reaching £11,000 before £9,000: {probability_of_upper:.2f}%")
+    print(f"Probability of passing: {probability_of_passing:.2f}%")
 
     # Plotting
     plt.figure(figsize=(14, 7))
@@ -1422,23 +1457,69 @@ def save_combined_results(combined_df, filename='combined_backtest_results.csv')
     print(f"Combined backtest results saved to {output_path}")
 
 def combine_forex_backtest():
+    result = []
     combined_df = combine_backtest_results()
     analyze_combined_data(combined_df)
     save_combined_results(combined_df, 'combined_backtest_results.csv')
+    analysis_results = analyze_pair_data(combined_df)
+    result.append({
+        'Probability': analysis_results['ProbabilityOfPassing'],
+        'TotalProfit': analysis_results['TotalCumulativeProfit'],
+        'CountPositiveReset': analysis_results['PositiveResets'],
+        'CountNegativeReset': analysis_results['NegativeResets'],
+        'CountDailyLossReset': analysis_results['daily_max_loss_count']
+    })
+    result_df = pd.DataFrame(result)
+    result_df.sort_values(by='Probability', ascending=False)
+    result_df.to_csv('probability_using_all_pairs.csv', index=False)
 
-def fetch_and_aggregate_results():
-    folders = fetch_forex_agent_folders()
-    combined_df = pd.DataFrame()
-    
-    for folder in folders:
+def fetch_and_aggregate_results(choice):
+    print(choice)
+    if choice in ('9', '11'):
+        folders = fetch_forex_agent_folders()
+        combined_df = pd.DataFrame()
+        
+        for folder in folders:
+            file_path = os.path.join(folder, 'trade_history_backtest.csv')
+            if os.path.exists(file_path):
+                df = pd.read_csv(file_path)
+                Pair, timeframe_str = extract_info_from_folder_name(folder)
+                df['Pair'] = Pair
+                df['Timeframe'] = timeframe_str  # Assuming folder names include this info
+                combined_df = pd.concat([combined_df, df], ignore_index=True)
+    elif choice == '1':
+        # Get the current working directory
+        current_directory = os.getcwd()
+        # List all subdirectories in the current directory
+        all_subdirs = [os.path.join(current_directory, d) for d in os.listdir(current_directory) if os.path.isdir(os.path.join(current_directory, d))]
+
+        # Find the most recent directory
+        most_recent_dir = max(all_subdirs, key=os.path.getmtime)
+        combined_df = pd.DataFrame()
+
+        file_path = os.path.join(most_recent_dir, 'trade_history_backtest.csv')
+        if os.path.exists(file_path):
+            df = pd.read_csv(file_path)
+            Pair, timeframe_str = extract_info_from_folder_name(most_recent_dir)
+            df['Pair'] = Pair
+            df['Timeframe'] = timeframe_str  # Assuming folder names include this info
+            combined_df = pd.concat([combined_df, df], ignore_index=True) 
+    else:
+        timeframe = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
+
+        pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
+
+        folder = find_recent_forex_agent_dir(pair, timeframe)
+
+        combined_df = pd.DataFrame()
+
         file_path = os.path.join(folder, 'trade_history_backtest.csv')
         if os.path.exists(file_path):
             df = pd.read_csv(file_path)
             Pair, timeframe_str = extract_info_from_folder_name(folder)
             df['Pair'] = Pair
             df['Timeframe'] = timeframe_str  # Assuming folder names include this info
-            combined_df = pd.concat([combined_df, df], ignore_index=True)
-    
+            combined_df = pd.concat([combined_df, df], ignore_index=True) 
     return combined_df
 
 def analyze_pair_data(df):
@@ -1452,12 +1533,19 @@ def analyze_pair_data(df):
     # Calculate daily profit
     daily_profit = df_copy.groupby('time')['profit'].sum()
 
+    worst_daily_pnl = df_copy.groupby('time')['worst_daily_pnl'].sum()
+
+    best_daily_pnl = df_copy.groupby('time')['best_daily_pnl'].sum()
+
     # Initial settings for simulation
     initial_balance = 10000
     upper_reset_threshold = 11000
     lower_reset_threshold = 9000
     upper_reset_count = 0
     lower_reset_count = 0
+
+    daily_max_loss_reset_threshold = 9500
+    daily_max_loss_count = 0
 
     # Calculate cumulative balance with resets
     balances = [initial_balance]
@@ -1472,18 +1560,33 @@ def analyze_pair_data(df):
         else:
             balances.append(new_balance)
 
-    # Calculate the probability of reaching the upper threshold before the lower threshold
-    total_resets = upper_reset_count + lower_reset_count
+    balances_2 = [initial_balance]
+
+    for worst_daily in worst_daily_pnl:
+        new_balance = balances_2[-1] + worst_daily
+        if new_balance <= daily_max_loss_reset_threshold:
+            balances_2.append(initial_balance)
+            daily_max_loss_count += 1
+        elif new_balance <= lower_reset_threshold:
+            balances.append(initial_balance)  # Reset to initial balance
+            lower_reset_count += 1
+        else:
+            balances_2.append(new_balance)
+
+    total_resets = upper_reset_count + lower_reset_count + daily_max_loss_count
     if total_resets > 0:
-        probability_of_upper = (upper_reset_count / total_resets) * 100
+        probability_of_passing = (upper_reset_count / total_resets) * 100
     else:
-        probability_of_upper = 0
+        probability_of_passing = 0  # Set probability to 0 (or another appropriate value) when no resets have occurred
+
+    print(f"Probability of passing: {probability_of_passing:.2f}%")
 
     return {
         'TotalCumulativeProfit': daily_profit.sum(),
-        'ProbabilityOfReachingUpperFirst': probability_of_upper,
+        'ProbabilityOfPassing': probability_of_passing,
         'PositiveResets': upper_reset_count,
-        'NegativeResets': lower_reset_count
+        'NegativeResets': lower_reset_count,
+        'daily_max_loss_count': daily_max_loss_count
     }
 
 def compute_probabilities(df):
@@ -1495,99 +1598,42 @@ def compute_probabilities(df):
         analysis_results = analyze_pair_data(sub_df)
         result.append({
             'Pair': pair,
-            'Probability': analysis_results['ProbabilityOfReachingUpperFirst'],
+            'Probability': analysis_results['ProbabilityOfPassing'],
             'TotalProfit': analysis_results['TotalCumulativeProfit'],
             'CountPositiveReset': analysis_results['PositiveResets'],
-            'CountNegativeReset': analysis_results['NegativeResets']
+            'CountNegativeReset': analysis_results['NegativeResets'],
+            'CountDailyLossReset': analysis_results['daily_max_loss_count']
         })
     
     result_df = pd.DataFrame(result)
     return result_df.sort_values(by='Probability', ascending=False)
 
-def perform_analysis():
-    combined_df = fetch_and_aggregate_results()
+def perform_analysis(choice):
+    combined_df = fetch_and_aggregate_results(choice)
     probability_rankings = compute_probabilities(combined_df)
-    probability_rankings.to_csv('forex_pair_probability_rankings.csv', index=False)
+    # Get the current working directory
+    current_directory = os.getcwd()
+    # List all subdirectories in the current directory
+    all_subdirs = [os.path.join(current_directory, d) for d in os.listdir(current_directory) if os.path.isdir(os.path.join(current_directory, d))]
+
+    # Find the most recent directory
+    most_recent_dir = max(all_subdirs, key=os.path.getmtime)
+
+    if choice not in ('9','6', '11'):
+        # Create the full path for the new CSV file
+        file_path = os.path.join(most_recent_dir, 'forex_pair_probability_rankings.csv')
+
+        # Save the DataFrame to CSV in the most recently created folder
+        probability_rankings.to_csv(file_path, index=False)
+    else:
+        probability_rankings.to_csv('forex_pair_probability_rankings.csv', index=False)
+
     print("Analysis complete. Results saved.")
-
-# Function to prepare, train RandomForest and find the optimal threshold
-def prepare_and_train_random_forest(choice):
-    # Retrieve and store the current date
-    current_date = str(datetime.now().date())
-
-    # Hardcoded start date for strategy evaluation
-    strategy_start_date_all = "1971-01-04"
-    # Use the current date as the end date for strategy evaluation
-    strategy_end_date_all = current_date
-
-    # Convert string representation of dates to datetime objects for further processing
-    start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
-    end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
-
-    # Prompt the user to decide if they want real-time data updates and store the boolean result
-    #enable_real_time = input("Do you want to enable real-time data updates? (yes/no): ").lower().strip() == 'yes'
-
-    # Prompt the user for the desired timeframe for analysis and standardize the input
-    timeframe_str = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
-    # Prompt the user for the currency pair they're interested in and standardize the input
-    Pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
-
-    training_start_date = "2000-01-01"
-    training_end_date = current_date
-
-    # Fetch and prepare the FX data for the specified currency pair and timeframe
-    eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
-
-    # Apply technical indicators to the data using the 'calculate_indicators' function
-    eur_usd_data = calculate_indicators(eur_usd_data, choice)
-
-    # Filter the EUR/USD data for the in-sample training period
-    dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
-
-    # Drop rows where any of the data is missing
-    dataset = dataset.dropna()
-
-    # Split the data
-    training_set, validation_set = split_and_save_dataset(dataset, timeframe_str, Pair)
-
-    # Feature selection
-    features = [col for col in training_set.columns if col != 'Actual Movement']
-    X_train = training_set[features]
-    y_train = training_set['Actual Movement']
-    X_validation = validation_set[features]
-    y_validation = validation_set['Actual Movement']
-
-    # Initialize and train RandomForest with probability prediction
-    rf_classifier = RandomForestClassifier(n_estimators=100, random_state=42, min_samples_split=10)
-    rf_classifier.fit(X_train, y_train)
-
-    # Predict probabilities on the validation set
-    y_probs = rf_classifier.predict_proba(X_validation)[:, 1]  # Probability of class 1
-
-    # Find the optimal threshold from probabilities
-    optimal_threshold = find_optimal_threshold_accuracy(y_validation, y_probs)
-
-    # Save the optimal threshold to JSON
-    save_optimal_threshold_json(optimal_threshold)
-
-    # Use the optimal threshold to make final predictions
-    y_pred = (y_probs >= optimal_threshold).astype(int)
-    final_accuracy = accuracy_score(y_validation, y_pred)
-
-    results_df = validation_set[['time', 'Actual Movement', 'close']].reset_index(drop=True)
-    results_df['Predictions'] = y_probs
-    results_df['Predicted'] = y_pred
-
-    results_df.to_csv('predicted_classification_with_Actual_Movement_and_close_MLP.csv', index=False)
-    
-    print(f"Final accuracy using optimal threshold: {final_accuracy:.2%}")
 
 def main_menu():
     while True:
         print("\nMain Menu:")
         print("1 - Train model with latest data - Forex")
-        print("2 - Train model with csv file data - futures")
-        print("3 - Predict Next- futures")
         print("4 - Predict Next- forex")
         print("5 - Predict Specific Date- forex")
         print("6 - Train Multiple - forex")
@@ -1595,18 +1641,12 @@ def main_menu():
         print("8 - Train model with latest data (Magnitude) - forex")
         print("9 - Combine Forex Data and see what is the probability of suceeding (combined) - forex")
         print("10 - Combine Forex Data and see what is the probability of suceeding (single) - forex")
-        print("11 - RFT - forex")
+        print("11 - Combine Forex Data and see what is the probability of suceeding (single of multiple) - forex")
 
         choice = input("Enter your choice (1/2/3): ")
 
         if choice == '1':
             training(choice)
-            break
-        elif choice == '2':
-            training(choice)
-            break
-        elif choice == '3':
-            predict_next_futures()
             break
         elif choice == '4':
             predict_next_forex(choice)
@@ -1627,10 +1667,10 @@ def main_menu():
             combine_forex_backtest()
             break
         elif choice == '10':
-            perform_analysis()
+            perform_analysis(choice)
             break
         elif choice == '11':
-            prepare_and_train_random_forest(choice)
+            perform_analysis(choice)
             break
         else:
             print("Invalid choice. Please enter 1, 2, 3, or 4.")

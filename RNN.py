@@ -217,6 +217,24 @@ def calculate_indicators(data, choice):
     # Drop the 'close_price_next' column if you no longer need it
     data.drop(columns=['close_price_next'], inplace=True)
 
+    horizons = [2, 5, 60, 250, 1000]
+
+    new_predictors = []
+
+    for horizon in horizons:
+        rolling_average = data.rolling(horizon).mean()
+
+        ratio_column = f'Close_Ratio_{horizon}'
+
+        data[ratio_column] = data['close'] / rolling_average['close']
+
+        trend_column = f'Trend_{horizon}'
+
+        data[trend_column] = data.shift(1).rolling(horizon).sum()['Actual Movement']
+
+        new_predictors += [ratio_column, trend_column]
+
+
     if choice == '1':
         # Remove the last row of the DataFrame
         data = data.drop(data.tail(1).index)
@@ -234,8 +252,6 @@ def calculate_movement(data):
         # Rename the column
         data.rename(columns={'Close': 'close'}, inplace=True)
 
-    data['close_price_percentage_change'] = data['close'].pct_change() * 100
-    data['close_price_previous_percentage_change'] = data['close_price_percentage_change'].shift(1)
     # Shift the 'close' column up to get the next 'close' price in the future
     data['close_price_next'] = data['close'].shift(-1)
 
@@ -245,6 +261,13 @@ def calculate_movement(data):
 
     # Drop the 'close_price_next' column if you no longer need it
     data.drop(columns=['close_price_next'], inplace=True)
+
+    # Adding rolling features, ratios, and more complex indicators
+    horizons = [2, 5, 60, 250, 1000]
+    for horizon in horizons:
+        rolling_mean = data['close'].rolling(window=horizon).mean()
+        data[f'Close_Ratio_{horizon}'] = data['close'] / rolling_mean
+        data[f'Trend_{horizon}'] = data['Actual Movement'].shift(1).rolling(window=horizon).sum()
 
     # Return the data with added indicators
     return data
@@ -528,7 +551,7 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A', sequence_length=None):
     plt.savefig('confusion_matrix.png')  # Save to the file system of this environment
 
     # Save all files except the specified ones
-    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'RFT.py']
+    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'XGboost.py']
     for file in os.listdir('.'):
         if file not in exclude_files and os.path.isfile(file):
             shutil.move(file, os.path.join(save_directory, file))
@@ -622,7 +645,9 @@ def predict_next_forex(choice, sequence_length):
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
     # Apply technical indicators to the data using the 'calculate_indicators' function
-    eur_usd_data = calculate_indicators(eur_usd_data, choice) 
+    #eur_usd_data = calculate_indicators(eur_usd_data, choice) 
+
+    calculate_movement(eur_usd_data)
 
     # Drop rows where any of the data is missing
     eur_usd_data = eur_usd_data.dropna()
@@ -740,7 +765,9 @@ def predict_specific(choice, sequence_length):
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
     # Apply technical indicators to the data using the 'calculate_indicators' function
-    eur_usd_data = calculate_indicators(eur_usd_data, choice) 
+    #eur_usd_data = calculate_indicators(eur_usd_data, choice) 
+
+    calculate_movement(eur_usd_data)
 
     # Filter the EUR/USD data for the in-sample training period
     dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
@@ -816,7 +843,8 @@ def training_forex_multiple(choice, Pair, timeframe_str, sequence_length):
     training_end_date = current_date
 
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
-    eur_usd_data = calculate_indicators(eur_usd_data, choice)
+    #eur_usd_data = calculate_indicators(eur_usd_data, choice)
+    calculate_movement(eur_usd_data)
     dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
     dataset = dataset.dropna()
 
@@ -998,7 +1026,9 @@ def training(choice, sequence_length):
         eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
         # Apply technical indicators to the data using the 'calculate_indicators' function
-        eur_usd_data = calculate_indicators(eur_usd_data, choice)
+        #eur_usd_data = calculate_indicators(eur_usd_data, choice)
+
+        calculate_movement(eur_usd_data)
 
         # Filter the EUR/USD data for the in-sample training period
         dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]

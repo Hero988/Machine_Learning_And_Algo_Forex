@@ -209,10 +209,24 @@ def calculate_indicators(data, choice):
     data['close_price_percentage_change'] = data['close'].pct_change().fillna(0) * 100
     data['previous_close_price_percentage_change'] = data['close_price_percentage_change'].shift(1)
 
-    data['Actual Movement Previous'] = data['Actual Movement'].shift(1)
+    horizons = [2, 5, 60, 250, 1000]
 
-    data['day_of_week'] = data.index.dayofweek
-    data['month_of_year'] = data.index.month
+    new_predictors = []
+
+    for horizon in horizons:
+        rolling_average = data.rolling(horizon).mean()
+
+        ratio_column = f'Close_Ratio_{horizon}'
+
+        data[ratio_column] = data['close'] / rolling_average['close']
+
+        trend_column = f'Trend_{horizon}'
+
+        data[trend_column] = data.shift(1).rolling(horizon).sum()['Actual Movement']
+
+        new_predictors += [ratio_column, trend_column]
+
+
 
     if choice == '1':
         # Remove the last row of the DataFrame
@@ -481,7 +495,7 @@ def evaluate(choice, Pair='N/A', timeframe_str='N/A'):
     plt.savefig('confusion_matrix.png')  # Save to the file system of this environment
 
     # Save all files except the specified ones
-    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'RFT.py']
+    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'XGboost.py']
     for file in os.listdir('.'):
         if file not in exclude_files and os.path.isfile(file):
             shutil.move(file, os.path.join(save_directory, file))
