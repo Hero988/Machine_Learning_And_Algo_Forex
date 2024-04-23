@@ -12,6 +12,9 @@ import shutil
 import time
 from dateutil.relativedelta import relativedelta
 from dateutil.parser import parse
+from sklearn.model_selection import ParameterGrid
+import json
+import time
 
 # On support and resistance section: https://www.youtube.com/watch?v=kzRsEU3M7zY&ab_channel=TheTradingGeek
 
@@ -144,7 +147,7 @@ def identify_flag_patterns(data):
 
     return data
 
-def trend_identification_live(data, window_size):
+def trend_identification_live(data, window_size, persistence_period):
     # Calculate rolling maximum of highs and minimum of lows
     data['rolling_max_high'] = data['high'].rolling(window=window_size, min_periods=1).max()
     data['rolling_min_low'] = data['low'].rolling(window=window_size, min_periods=1).min()
@@ -186,8 +189,6 @@ def trend_identification_live(data, window_size):
     data['potential_breakdown_retest'] = data['low'] < data['last_higher_low']
     data['potential_breakout_retest'] = data['high'] > data['last_lower_high']
 
-    # Applying the 5-period persistence for retests
-    persistence_period = 5
     # Iterate through the DataFrame using integer index with .iloc or use the actual DateTime index with .at
     for i in range(len(data)):
         current_time = data.index[i]
@@ -212,6 +213,100 @@ def trend_identification_live(data, window_size):
                                       (data['low'].shift(1) > data['low'])
 
     return data
+
+# https://www.youtube.com/watch?v=ZTMregh_428&t=40s&ab_channel=TradingLab
+def identify_fair_value_gaps(data, window):
+    """
+    Identify and mark fair value gaps, checking if they coincide with a break of structure and using the candle's type to determine the direction.
+    """
+    # Calculate the percentage change in closing prices
+    data['Close_pct_change'] = data['close'].pct_change().abs()
+    
+    # Identify Bull, Bear, or Neutral candle
+    data['candle_type'] = np.where(data['close'] > data['open'], 1,
+                                   np.where(data['close'] < data['open'], -1, 0))
+    
+    # Calculate rolling maximum of highs and minimum of lows
+    data['rolling_max_high'] = data['high'].rolling(window, min_periods=1).max()
+    data['rolling_min_low'] = data['low'].rolling(window, min_periods=1).min()
+
+    # Calculate global IQR for gap detection
+    Q1 = data['Close_pct_change'].quantile(0.25)
+    Q3 = data['Close_pct_change'].quantile(0.75)
+    IQR = Q3 - Q1
+    outlier_threshold = Q3 + 1.5 * IQR
+    
+    # Initialize columns for storing gap information
+    data['Gap'] = False
+    data['Gap_Valid'] = False
+    data['Gap_Direction'] = None
+    data['Gap_Zone_High_Low'] = None
+    data['Gap_Touched'] = False
+    data['Gap_Closed_Inside'] = False
+    data['Gap_Zone_High'] = None 
+    data['Gap_Zone_Low'] = None 
+    data['Gap_Closed_Inside_Direction'] = None
+
+    # List to track ongoing gaps
+    active_gaps = []
+
+    # Iterate through each row in the DataFrame after the first few
+    for i in range(2, len(data)):
+        current_index = data.index[i]
+        previous_index = data.index[i-1]
+        two_candles_ago_index = data.index[i-2]
+        
+        previous_high = data.at[previous_index, 'high']
+        previous_low = data.at[previous_index, 'low']
+
+        latest_rolling_max_high = data['rolling_max_high'].iloc[-1]
+        latest_rolling_min_low = data['rolling_min_low'].iloc[-1]
+
+        # Check for gap in the previous candle
+        if data.at[previous_index, 'Close_pct_change'] > outlier_threshold and (previous_high > latest_rolling_max_high or previous_low <  latest_rolling_min_low):
+            data.at[previous_index, 'Gap'] = True
+            
+            # Determine the direction of the gap based on the candle type
+            gap_direction = 'Bearish' if data.at[previous_index, 'candle_type'] == -1 else 'Bullish' if data.at[previous_index, 'candle_type'] == 1 else 'Neutral'
+
+            Gap_Closed_Inside = False
+
+            # High from two candles ago (before the gap)
+            high_before_gap = data.at[two_candles_ago_index, 'high']
+            # Low from the current candle (immediately after the gap)
+            low_after_gap = data.at[current_index, 'low']
+            
+            # Initialize gap validity and zone for the current candle if it's not neutral
+            if gap_direction != 'Neutral':
+                data.at[current_index, 'Gap_Zone_High_Low'] = (high_before_gap, low_after_gap)
+                data.at[current_index, 'Gap_Direction'] = gap_direction
+                data.at[current_index, 'Gap_Valid'] = True
+                active_gaps.append((current_index, high_before_gap, low_after_gap, gap_direction, Gap_Closed_Inside))
+
+        # Update validity for active gaps
+        for gap in list(active_gaps):
+            gap_index, gap_high, gap_low, gap_dir, Gap_Closed_Inside = gap
+            # Check if current price action touches the gap zone
+            if (data.at[current_index, 'high'] >= gap_low and data.at[current_index, 'high'] <= gap_high):
+                data.at[current_index, 'Gap_Touched'] = True
+            # Check if the candle closed inside the gap zone
+            if data.at[current_index, 'close'] >= gap_low and data.at[current_index, 'close'] <= gap_high and data.at[previous_index, 'Gap_Zone_High_Low'] is None and data.at[current_index, 'Gap_Zone_High_Low'] is None and Gap_Closed_Inside == False:
+                Gap_Closed_Inside = True
+                data.at[current_index, 'Gap_Closed_Inside'] = True
+                if data.at[gap_index, 'Gap_Valid'] == True:
+                    data.at[current_index, 'Gap_Zone_High'] = gap_high
+                    data.at[current_index, 'Gap_Zone_Low'] = gap_low
+                    data.at[current_index, 'Gap_Closed_Inside_Direction'] = gap_dir 
+            # Check if the candle closed through the gap zone (in the direction of the gap)
+            if (gap_dir == 'Bearish' and data.at[current_index, 'close'] > gap_high) or \
+                (gap_dir == 'Bullish' and data.at[current_index, 'close'] < gap_low):
+                data.at[gap_index, 'Gap_Valid'] = False
+                active_gaps.remove(gap)  # Invalidate the gap if closed through
+            else:
+                # Extend validity if not touched
+                data.at[gap_index, 'Gap_Valid'] = True
+
+    return data, active_gaps
 
 def calculate_movement(data):
     # Initialize candlestick pattern encoding
@@ -390,20 +485,23 @@ def read_csv_to_dataframe(file_path):
 def main_training_loop_multiple_pairs():
     # Define a list of forex pairs
     forex_pairs = [
-        'EURUSD', 'GBPUSD', 'USDCHF', 'USDJPY', 'USDCAD',
-        'AUDUSD', 'AUDNZD', 'AUDCAD', 'AUDCHF', 'AUDJPY',
-        'GBPCAD', 'NZDUSD', 'CHFJPY', 'EURGBP', 'EURAUD',
-        'EURCHF', 'EURJPY', 'EURNZD', 'EURCAD', 'GBPCAD',
-        'GBPCHF', 'GBPJPY', 'CADCHF', 'CADJPY', 'GBPAUD',
-        'GBPNZD', 'NZDCAD', 'NZDCHF', 'NZDJPY'
+        'EURUSD', 'GBPUSD', 'USDCHF', 'USDCAD',
+        'AUDUSD', 'AUDNZD', 'AUDCAD', 'AUDCHF',
+        'GBPCAD', 'NZDUSD', 'EURGBP', 'EURAUD',
+        'EURCHF', 'EURNZD', 'EURCAD', 'GBPCAD',
+        'GBPCHF', 'CADCHF', 'GBPAUD',
+        'GBPNZD', 'NZDCAD', 'NZDCHF',
     ]
     
     # Ask user for the timeframe
     timeframe = input("Enter the timeframe (e.g., Daily, 1H): ").strip().upper()
 
+    use_param_grid = input("Do you want to use grid search: ").strip()
+
     # Strategy Selection
     strategies = {
-        '1': 'Reversal'
+        '3': 'Fair Value Gap',
+        '1': 'Reversal',
         # Add more strategies as needed
     }
 
@@ -413,9 +511,9 @@ def main_training_loop_multiple_pairs():
     for strategy_key in strategies:
         for pair in forex_pairs:
             print(f"Training for {pair} on {timeframe} using {strategies[strategy_key]}")
-            multiple_manual_trading(choice, pair, timeframe, strategy_key)
+            multiple_manual_trading(choice, pair, timeframe, strategy_key, use_param_grid)
 
-def multiple_manual_trading(choice, Pair, timeframe_str, choice_strategy):
+def multiple_manual_trading(choice, Pair, timeframe_str, choice_strategy, use_param_grid):
     # Retrieve and store the current date
     current_date = str(datetime.now().date())
 
@@ -431,24 +529,91 @@ def multiple_manual_trading(choice, Pair, timeframe_str, choice_strategy):
     training_start_date = "2000-01-01"
     training_end_date = current_date
 
-    window_size = 5
-
     # Fetch and prepare the FX data for the specified currency pair and timeframe
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
+    if use_param_grid == True:
+        # Setting up parameter grid
+        param_grid = {
+            'window_size': range(5, 21, 5),  # Example: testing window sizes 5, 10, 15, 20
+            'persistence_period': range(3, 13, 3)  # Example: testing persistence periods 3, 6, 9, 12
+        }
+
+        # DataFrame to store results
+        results_df = pd.DataFrame(columns=['window_size', 'persistence_period'])
+
+        # Grid search over parameters
+        for params in ParameterGrid(param_grid):
+            highest_probability = evaluate_parameters(params['window_size'], params['persistence_period'], choice_strategy, eur_usd_data, training_start_date, training_end_date, timeframe_str, Pair, choice)
+
+            # Create a DataFrame for the current results and concatenate it
+            current_results = pd.DataFrame([{
+                'window_size': params['window_size'],
+                'persistence_period': params['persistence_period'],
+                'highest_probability': highest_probability
+            }])
+            results_df = pd.concat([results_df, current_results], ignore_index=True)
+
+            # Save the current results to a CSV file
+            current_results.to_csv(f'current_parameters.csv', index=False)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Managing directories for results
+            if choice_strategy == '1':
+                save_directory = f'backtest_reversal_patterns_{highest_probability:.2f}%_{Pair}_{timeframe_str}_{timestamp}'
+            elif choice_strategy == '2':
+                save_directory = f'backtest_flag_patterns_{highest_probability:.2f}%_{Pair}_{timeframe_str}_{timestamp}'
+            elif choice_strategy == '3':
+                save_directory = f'fair_value_gap_{highest_probability:.2f}%_{Pair}_{timeframe_str}_{timestamp}'
+            if not os.path.exists(save_directory):
+                os.makedirs(save_directory)
+
+            # Save all files except the specified ones
+            exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'XGboost.py', 'manual.py']
+            for file in os.listdir('.'):
+                if file not in exclude_files and os.path.isfile(file):
+                    shutil.move(file, os.path.join(save_directory, file))
+    else:
+        window_size = 10
+        persistence_period = 5
+        highest_probability = evaluate_parameters(window_size, persistence_period, choice_strategy, eur_usd_data, training_start_date, training_end_date, timeframe_str, Pair, choice)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Managing directories for results
+        if choice_strategy == '1':
+            save_directory = f'backtest_reversal_patterns_{highest_probability:.2f}%_{Pair}_{timeframe_str}_{timestamp}'
+        elif choice_strategy == '2':
+            save_directory = f'backtest_flag_patterns_{highest_probability:.2f}%_{Pair}_{timeframe_str}_{timestamp}'
+        elif choice_strategy == '3':
+            save_directory = f'fair_value_gap_{highest_probability:.2f}%_{Pair}_{timeframe_str}_{timestamp}'
+        if not os.path.exists(save_directory):
+            os.makedirs(save_directory)
+
+        # Save all files except the specified ones
+        exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'XGboost.py', 'manual.py']
+        for file in os.listdir('.'):
+            if file not in exclude_files and os.path.isfile(file):
+                shutil.move(file, os.path.join(save_directory, file))
+
+def evaluate_parameters(window_size, persistence_period, choice_strategy, eur_usd_data, training_start_date, training_end_date, timeframe_str, Pair, choice):
     if choice_strategy == '1':
-        trend_identification_live(eur_usd_data, window_size)
+        trend_identification_live(eur_usd_data, window_size, persistence_period)
+        dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
+        # Drop rows where any of the data is missing
+        dataset = dataset.dropna()
+        backtest_set = get_backtest_data(dataset, timeframe_str, Pair)
     elif choice_strategy == '2':
         identify_flag_patterns(eur_usd_data)
-
-    # Filter the EUR/USD data for the in-sample training period
-    dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
-
-    # Drop rows where any of the data is missing
-    dataset = dataset.dropna()
-
-    backtest_set = get_backtest_data(dataset, timeframe_str, Pair)
-
+        dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
+        # Drop rows where any of the data is missing
+        dataset = dataset.dropna()
+        backtest_set = get_backtest_data(dataset, timeframe_str, Pair)
+    elif choice_strategy == '3':
+        # Filter the EUR/USD data for the in-sample training period
+        dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
+        backtest_set = get_backtest_data(dataset, timeframe_str, Pair)
+        identify_fair_value_gaps(backtest_set, window_size)
+        
     initial_balance=10000
     leverage=30
     transaction_cost=0.0002
@@ -467,6 +632,7 @@ def multiple_manual_trading(choice, Pair, timeframe_str, choice_strategy):
         lot_size,
     )
     backtest_set = backtest_set.reset_index()
+    print('simulate_trading')
     trader.simulate_trading(backtest_set, choice_strategy)
 
     trader.plot_balance_over_time(folder_name)
@@ -481,42 +647,7 @@ def multiple_manual_trading(choice, Pair, timeframe_str, choice_strategy):
 
     highest_probability = perform_analysis(choice)
 
-    if choice_strategy == '1':
-        save_directory = f'bactest_reversal_patterns_{highest_probability:.2f}%_{Pair}_{timeframe_str}'
-    elif choice_strategy == '2':
-        save_directory = f'bactest_flag_patterns_{highest_probability:.2f}%_{Pair}_{timeframe_str}'
-    if not os.path.exists(save_directory):
-        os.makedirs(save_directory)
-
-    # Save all files except the specified ones
-    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'XGboost.py', 'manual.py']
-
-    for file in os.listdir('.'):
-        if file not in exclude_files and os.path.isfile(file):
-            shutil.move(file, os.path.join(save_directory, file))
-
-def different():
-    """
-    identify_flag_patterns()
-    # Check if there is a change in predicted movement
-    if row['bullish_breakout'] == True and (not self.is_open_position or self.position == 'short'):
-        self.open_position(row['close'], 'long', row['time'])
-    elif row['bearish_breakdown'] == True and (not self.is_open_position or self.position == 'long'):
-        self.open_position(row['close'], 'short', row['time'])
-    # Log the trade as hold if there is no change in position
-    elif self.is_open_position:
-        self.log_trade('hold', row['close'], row['time'])
-
-    trend_identification(data, window_size)
-    # Check if there is a change in predicted movement
-    if row['trend_change'] == True and row['uptrend'] == True and (not self.is_open_position or self.position == 'short'):
-        self.open_position(row['close'], 'long', row['time'])
-    elif row['trend_change'] == True and row['uptrend'] == True and (not self.is_open_position or self.position == 'long'):
-        self.open_position(row['close'], 'short', row['time'])
-    # Log the trade as hold if there is no change in position
-    elif self.is_open_position:
-        self.log_trade('hold', row['close'], row['time'])
-    """
+    return highest_probability
 
 def manual_trading(choice):
     # Retrieve and store the current date
@@ -545,75 +676,55 @@ def manual_trading(choice):
     # Fetch and prepare the FX data for the specified currency pair and timeframe
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
-    window_size = 5
-
     while True:
         print("\nPlease choose strategy you would like to use:")
         print("1 - Reversal")
         print("2 - Flag")
 
         choice_strategy = input("Enter your choice (1/2/3): ")
+        break
 
+    # Setting up parameter grid
+    param_grid = {
+        'window_size': range(5, 21, 5),  # Example: testing window sizes 5, 10, 15, 20
+        'persistence_period': range(3, 13, 3)  # Example: testing persistence periods 3, 6, 9, 12
+    }
+
+    # DataFrame to store results
+    results_df = pd.DataFrame(columns=['window_size', 'persistence_period'])
+
+    # Grid search over parameters
+    for params in ParameterGrid(param_grid):
+        highest_probability = evaluate_parameters(params['window_size'], params['persistence_period'], choice_strategy, eur_usd_data, training_start_date, training_end_date, timeframe_str, Pair, choice)
+
+        # Create a DataFrame for the current results and concatenate it
+        current_results = pd.DataFrame([{
+            'window_size': params['window_size'],
+            'persistence_period': params['persistence_period'],
+            'highest_probability': highest_probability
+        }])
+        results_df = pd.concat([results_df, current_results], ignore_index=True)
+
+        # Save the current results to a CSV file
+        current_results.to_csv(f'current_parameters.csv', index=False)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Managing directories for results
         if choice_strategy == '1':
-            trend_identification_live(eur_usd_data, window_size)
-            break
+            save_directory = f'backtest_reversal_patterns_{highest_probability:.2f}%_{Pair}_{timeframe_str}_{timestamp}'
         elif choice_strategy == '2':
-            identify_flag_patterns(eur_usd_data)
-            break
+            save_directory = f'backtest_flag_patterns_{highest_probability:.2f}%_{Pair}_{timeframe_str}_{timestamp}'
+        elif choice_strategy == '3':
+            save_directory = f'fair_value_gap_{highest_probability:.2f}%_{Pair}_{timeframe_str}_{timestamp}'
+        if not os.path.exists(save_directory):
+            os.makedirs(save_directory)
 
-    # Filter the EUR/USD data for the in-sample training period
-    dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
-
-    # Drop rows where any of the data is missing
-    dataset = dataset.dropna()
-
-    backtest_set = get_backtest_data(dataset, timeframe_str, Pair)
-
-    initial_balance=10000
-    leverage=30
-    transaction_cost=0.0002
-
-    folder_name = os.getcwd()
-
-    if 'JPY' in Pair:
-        lot_size = 100  # Smaller lot size for pairs including JPY
-    else:
-        lot_size = 1000  # Default lot size for other pairs
-
-    trader = ForexTradingSimulator(
-        initial_balance,
-        leverage,
-        transaction_cost,
-        lot_size,
-    )
-    backtest_set = backtest_set.reset_index()
-    trader.simulate_trading(backtest_set, choice_strategy)
-
-    trader.plot_balance_over_time(folder_name)
-
-    trade_history_df = pd.DataFrame(trader.trade_history)
-
-    trade_history_filename = os.path.join(folder_name, 'trade_history_backtest.csv')
-    trade_history_df.to_csv(trade_history_filename)
-
-    data_csv_filename = os.path.join(folder_name, 'data_backtest.csv')
-    backtest_set.to_csv(data_csv_filename)
-
-    highest_probability = perform_analysis(choice)
-
-    if choice_strategy == '1':
-        save_directory = f'bactest_reversal_patterns_{highest_probability:.2f}%_{Pair}_{timeframe_str}'
-    elif choice_strategy == '2':
-        save_directory = f'bactest_flag_patterns_{highest_probability:.2f}%_{Pair}_{timeframe_str}'
-    if not os.path.exists(save_directory):
-        os.makedirs(save_directory)
-
-    # Save all files except the specified ones
-    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'XGboost.py', 'manual.py']
-
-    for file in os.listdir('.'):
-        if file not in exclude_files and os.path.isfile(file):
-            shutil.move(file, os.path.join(save_directory, file))
+        # Save all files except the specified ones
+        exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'XGboost.py', 'manual.py']
+        for file in os.listdir('.'):
+            if file not in exclude_files and os.path.isfile(file):
+                shutil.move(file, os.path.join(save_directory, file))
 
 def perform_analysis(choice):
     combined_df = pd.read_csv('trade_history_backtest.csv')
@@ -649,7 +760,8 @@ class ForexTradingSimulator:
         self.last_processed_date = None  # Keep track of the last processed date
         self.daily_worst_pnl = 0  # Initialize daily profit and loss
         self.daily_best_pnl = 0 
-
+        self.monetary_loss = -(self.initial_balance * 0.005)  # Stop loss threshold in percentage (0.5%)
+        self.monetary_gain = self.initial_balance * 0.01  # Take profit threshold in percentage (1%)
 
     def open_position(self, current_price, position_type, time):
         if not self.is_open_position:
@@ -683,6 +795,7 @@ class ForexTradingSimulator:
 
     def log_trade(self, action, price, time, profit=None):
         self.trade_history.append({
+            'current_price': price,
             'time': time,
             'action': action,
             'position': self.position,
@@ -691,7 +804,7 @@ class ForexTradingSimulator:
             'profit': profit,
             'balance': self.current_balance,
             'worst_daily_pnl': self.daily_worst_pnl,
-            'best_daily_pnl': self.daily_best_pnl
+            'best_daily_pnl': self.daily_best_pnl,
         })
 
     def update_current_pnl(self, high_price, low_price):
@@ -730,22 +843,12 @@ class ForexTradingSimulator:
 
             self.daily_best_pnl += self.best_case_pnl
 
-            # Check profit and close the trade if profit/loss threshold is crossed
             if self.is_open_position:
-                # Determine closing logic based on position type
-                if self.position == 'long':
-                    # Close long position at the highest price if profit is good or at the lowest if loss is too high
-                    if self.daily_best_pnl >= 100:
-                        self.close_position(None, row['time'], profit=100)  # Close at high for maximum profit
-                    elif self.daily_worst_pnl <= -50:
-                        self.close_position(None, row['time'], profit=-50)  # Close at low to stop further loss
-                elif self.position == 'short':
-                    # Close short position at the lowest price if profit is good or at the highest if loss is too high
-                    if self.daily_best_pnl >= 100:
-                        self.close_position(None, row['time'],  profit=100)  # Close at low for maximum profit
-                    elif self.daily_worst_pnl <= -50:
-                        self.close_position(None, row['time'], profit=-50)  # Close at high to stop further loss
-
+                if self.daily_worst_pnl <= self.monetary_loss:
+                    self.close_position(None, row['time'], self.monetary_loss)
+                elif self.daily_best_pnl >= self.monetary_gain:
+                    self.close_position(None, row['time'], self.monetary_gain)
+            
             if choice_strategy == '1':
                 # Check if there is a change in predicted movement
                 if row['confirm_breakout_retest'] == True and (not self.is_open_position or self.position == 'short'):
@@ -764,6 +867,15 @@ class ForexTradingSimulator:
                 # Log the trade as hold if there is no change in position
                 elif self.is_open_position:
                     self.log_trade('hold', row['close'], row['time'])
+            elif choice_strategy == '3':
+                if row['Gap_Closed_Inside'] == True and row['Gap_Closed_Inside_Direction'] == 'Bullish' and (not self.is_open_position or self.position == 'short'):
+                    self.open_position(row['close'], 'long', row['time'])
+                elif row['Gap_Closed_Inside'] == True and row['Gap_Closed_Inside_Direction'] == 'Bearish' and (not self.is_open_position or self.position == 'long'):
+                    self.open_position(row['close'], 'short', row['time'])
+                # Log the trade as hold if there is no change in position
+                elif self.is_open_position:
+                    self.log_trade('hold', row['close'], row['time'])
+
 
     def plot_balance_over_time(self, folder_name):
         # Create a DataFrame from the trade history
@@ -1162,6 +1274,7 @@ def get_latest_data():
         hours_difference = int(time_difference.total_seconds() / 3600) + 3
 
         window_size = 5
+        persistence_period = 5
 
         initialize_mt5()
         data = fetch_live_data(Pair, timeframe_str, hours_difference)
@@ -1174,8 +1287,10 @@ def get_latest_data():
             # Calculate indicators for the updated dataset
             # Concatenate new data
             updated_dataset = pd.concat([dataset, data]).drop_duplicates()
+
+            identify_fair_value_gaps(updated_dataset, window_size)
             
-            updated_dataset = trend_identification_live(updated_dataset, window_size)
+            #updated_dataset = trend_identification_live(updated_dataset, window_size, persistence_period)
             
             # Get the latest time index
             latest_time_index = updated_dataset.index[-1].strftime('%Y-%m-%d %H:%M:%S')
@@ -1200,10 +1315,10 @@ def get_latest_data():
 
             # Decision making based on the latest row analysis
             action = 'no buy or sell'
-            if latest_row['confirm_breakout_retest']:
+            if latest_row['Gap_Closed_Inside'] == True and latest_row['Gap_Closed_Inside_Direction'] == 'Bullish':
                 action = 'buy'
                 execute_trade(Pair, 'buy', 0.5, 1)
-            elif latest_row['confirm_breakdown_retest']:
+            elif latest_row['Gap_Closed_Inside'] == True and latest_row['Gap_Closed_Inside_Direction'] == 'Bearish':
                 execute_trade(Pair, 'sell', 0.5, 1)
                 action = 'sell'
 
@@ -1232,6 +1347,40 @@ def get_latest_data():
             print(f"Next candle will form at: {next_candle_time_str} and the current time is {time_string}")
             countdown(sleep_time)  # Display countdown
 
+def test_data():
+    # Retrieve and store the current date
+    current_date = str(datetime.now().date())
+
+    # Hardcoded start date for strategy evaluation
+    strategy_start_date_all = "1971-01-04"
+    # Use the current date as the end date for strategy evaluation
+    strategy_end_date_all = current_date
+
+    # Convert string representation of dates to datetime objects for further processing
+    start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
+    end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
+
+    # Prompt the user for the desired timeframe for analysis and standardize the input
+    timeframe_str = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
+    # Prompt the user for the currency pair they're interested in and standardize the input
+    Pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
+
+    # Fetch and prepare the FX data for the specified currency pair and timeframe
+    eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
+
+    training_start_date = "2000-01-01"
+    training_end_date = current_date
+
+    choice_strategy = 3
+
+    # Filter the EUR/USD data for the in-sample training period
+    dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
+
+    # Drop rows where any of the data is missing
+    dataset = dataset.dropna()
+
+    backtest_set = get_backtest_data(dataset, timeframe_str, Pair)
+   
 def main_menu():
     while True:
         print("\nMain Menu:")
@@ -1239,6 +1388,7 @@ def main_menu():
         print("2 - Forex Trading Strategy (multiple)")
         print("3 - Analysis (combined)")
         print("4 - Live Trading")
+        print("5 - Test Data")
 
         choice = input("Enter your choice (1/2/3): ")
 
@@ -1253,6 +1403,9 @@ def main_menu():
             break
         elif choice == '4':
             get_latest_data()
+            break
+        elif choice == '5':
+            test_data()
             break
 
 if __name__ == "__main__":
