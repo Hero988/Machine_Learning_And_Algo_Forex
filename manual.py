@@ -1052,6 +1052,68 @@ def initialize_mt5():
     else:
         print("Connected to MetaTrader 5")
 
+def execute_trade(symbol, trade_type, stop_loss_percent, take_profit_percent):
+    # Initialize MT5 connection
+    if not mt5.initialize():
+        print("initialize() failed, error code =", mt5.last_error())
+        return
+
+    # Check if we are already in a trade for the specified symbol
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        print("Failed to get positions, error code =", mt5.last_error())
+    elif len(positions) > 0:
+        print("Already in a trade on", symbol)
+    else:
+        # Get the current market price
+        price_info = mt5.symbol_info_tick(symbol)
+        print(price_info)
+        if price_info is None:
+            print("Failed to get price for symbol", symbol)
+        else:
+            ask = price_info.ask  # price for buy orders
+            bid = price_info.bid  # price for sell orders
+            current_price = price_info.last
+
+            # Define the order type based on trade type
+            order_type = mt5.ORDER_TYPE_BUY if trade_type == 'buy' else mt5.ORDER_TYPE_SELL
+
+            # Calculate stop loss and take profit prices based on whether the trade is a buy or sell
+            if order_type == mt5.ORDER_TYPE_BUY:
+                # For buy orders, use the ask price
+                sl_price = ask * (1 - stop_loss_percent / 100)  # Stop loss below the ask price
+                tp_price = ask * (1 + take_profit_percent / 100)  # Take profit above the ask price
+            else:
+                # For sell orders, use the bid price
+                sl_price = bid * (1 + stop_loss_percent / 100)  # Stop loss above the bid price
+                tp_price = bid * (1 - take_profit_percent / 100)  # Take profit below the bid price
+
+            # Create trade request
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": 0.1,
+                "type": order_type,
+                "price": current_price,
+                "sl": sl_price,
+                "tp": tp_price,
+                "deviation": 10,
+                "magic": 234000,
+                "comment": "python script open",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            # Send the trade request
+            result = mt5.order_send(request)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                print("Failed to send order :", result)
+            else:
+                print("Order executed, ", result)
+
+    # Disconnect from MT5
+    mt5.shutdown()
+
 def get_latest_data():
     # Retrieve and store the current date
     current_date = str(datetime.now().date())
@@ -1140,7 +1202,9 @@ def get_latest_data():
             action = 'no buy or sell'
             if latest_row['confirm_breakout_retest']:
                 action = 'buy'
+                execute_trade(Pair, 'buy', 0.5, 1)
             elif latest_row['confirm_breakdown_retest']:
+                execute_trade(Pair, 'sell', 0.5, 1)
                 action = 'sell'
 
             # Prepare the data to be saved
