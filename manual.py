@@ -1165,6 +1165,7 @@ def initialize_mt5():
         print("Connected to MetaTrader 5")
 
 def execute_trade(symbol, trade_type, stop_loss_percent, take_profit_percent):
+    in_trade = False
     # Initialize MT5 connection
     if not mt5.initialize():
         print("initialize() failed, error code =", mt5.last_error())
@@ -1176,6 +1177,7 @@ def execute_trade(symbol, trade_type, stop_loss_percent, take_profit_percent):
         print("Failed to get positions, error code =", mt5.last_error())
     elif len(positions) > 0:
         print("Already in a trade on", symbol)
+        in_trade = True
     else:
         # Get the current market price
         price_info = mt5.symbol_info_tick(symbol)
@@ -1225,6 +1227,8 @@ def execute_trade(symbol, trade_type, stop_loss_percent, take_profit_percent):
 
     # Disconnect from MT5
     mt5.shutdown()
+
+    return in_trade
 
 def get_latest_data():
     # Retrieve and store the current date
@@ -1317,10 +1321,14 @@ def get_latest_data():
             action = 'no buy or sell'
             if latest_row['Gap_Closed_Inside'] == True and latest_row['Gap_Closed_Inside_Direction'] == 'Bullish':
                 action = 'buy'
-                execute_trade(Pair, 'buy', 0.5, 1)
+                in_trade = execute_trade(Pair, 'buy', 0.5, 1)
+                if in_trade:
+                    action = 'holding'
             elif latest_row['Gap_Closed_Inside'] == True and latest_row['Gap_Closed_Inside_Direction'] == 'Bearish':
-                execute_trade(Pair, 'sell', 0.5, 1)
                 action = 'sell'
+                in_trade = execute_trade(Pair, 'sell', 0.5, 1)
+                if in_trade:
+                    action = 'holding'
 
             # Prepare the data to be saved
             output_data = {
