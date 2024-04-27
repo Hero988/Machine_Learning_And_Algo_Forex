@@ -21,9 +21,142 @@ from sklearn.ensemble import RandomForestClassifier
 import time
 import shutil
 import joblib
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler
+import optuna
+
+class ForexTradingSimulator:
+    def __init__(self, initial_balance, leverage, transaction_cost, lot_size):
+        self.current_balance = initial_balance
+        self.initial_balance = initial_balance
+        self.leverage = leverage
+        self.transaction_cost = transaction_cost
+        self.lot_size = lot_size
+        self.trade_history = []
+        self.position = 'neutral'
+        self.entry_price = None
+        self.is_open_position = False
+        self.worst_case_pnl = 0
+        self.best_case_pnl = 0
+        self.worst_balance = 0
+        self.last_processed_date = None  # Keep track of the last processed date
+        self.monetary_loss = -(self.initial_balance * 0.005)  # Stop loss threshold in percentage (0.5%)
+        self.monetary_gain = self.initial_balance * 0.01  # Take profit threshold in percentage (1%)
+        self.stop_loss = 0
+        self.take_profit = 0
+        self.stop_loss_percent = 0.5
+        self.take_profit_percent = 1.5
+
+    def open_position(self, current_price, position_type, time):
+        if not self.is_open_position:
+            cost = self.transaction_cost
+            self.current_balance -= cost  # Transaction cost
+            self.entry_price = current_price
+            self.position = position_type
+            self.is_open_position = True
+
+            # Calculate stop loss and take profit prices based on whether the trade is a buy or sell
+            if position_type == 'long':
+                # For buy orders, use the ask price
+                self.stop_loss = current_price * (1 - self.stop_loss_percent / 100)  # Stop loss below the ask price
+                self.take_profit = current_price * (1 + self.take_profit_percent / 100)  # Take profit above the ask price
+            elif position_type == 'short':
+                # For sell orders, use the bid price
+                self.stop_loss = current_price  * (1 + self.stop_loss_percent / 100)  # Stop loss above the bid price
+                self.take_profit = current_price * (1 - self.take_profit_percent / 100)  # Take profit below the bid price
+
+            # Log the trade
+            self.log_trade('open', current_price, time,)
+
+    def close_position(self, current_price=None, time=None, profit=None):
+        if current_price != None:
+            if self.is_open_position:
+                if self.position == 'long':
+                    profit = (current_price - self.entry_price) * self.lot_size
+                elif self.position == 'short':
+                    profit = (self.entry_price - current_price) * self.lot_size
+
+                self.current_balance += profit - self.transaction_cost
+                self.is_open_position = False
+                self.position = 'neutral'
+                self.take_profit = 0
+                self.stop_loss = 0
+        else:
+            self.current_balance += profit - self.transaction_cost
+            self.is_open_position = False
+            self.position = 'neutral'
+            self.take_profit = 0
+            self.stop_loss = 0
+
+        # Log the trade
+        self.log_trade('close', current_price, time , profit)
+
+    def log_trade(self, action, price, time, profit=None):
+        self.trade_history.append({
+            'current_price': price,
+            'time': time,
+            'action': action,
+            'position': self.position,
+            'entry_price': self.entry_price if action == 'open' else None,
+            'close_price': price if action == 'close' else None,
+            'profit': profit,
+            'balance': self.current_balance,
+            'worst_case_pnl': self.worst_case_pnl,
+            'best_cast_pnl': self.best_case_pnl
+        })
+
+    def update_current_pnl(self, high_price, low_price):
+        if self.position == 'long':
+            # Worst-case loss for a long position at the lowest price
+            self.worst_case_pnl = (low_price - self.entry_price) * self.lot_size - self.transaction_cost
+            # Best-case profit for a long position at the highest price
+            self.best_case_pnl = (high_price - self.entry_price) * self.lot_size - self.transaction_cost
+        elif self.position == 'short':
+            # Worst-case loss for a short position at the highest price
+            self.worst_case_pnl = (self.entry_price - high_price) * self.lot_size - self.transaction_cost
+            # Best-case profit for a short position at the lowest price
+            self.best_case_pnl = (self.entry_price - low_price) * self.lot_size - self.transaction_cost
+        else:
+            # If there is no open position, set both PnLs to 0
+            self.worst_case_pnl = 0
+            self.best_case_pnl = 0
+
+    def simulate_trading(self, data):
+        for _, row in data.iterrows():
+            current_date = row['time'].date()  # Assuming 'time' is a datetime object
+
+            # Update P&L after potentially resetting it for a new day
+            self.update_current_pnl(row['high'], row['low'])
+            
+            # Check if there is a change in predicted movement and the current position status
+            if row['Predicted Movement'] == 1 and self.position != 'long':
+                if self.position:  # If there is an existing position, close it
+                    self.close_position(current_price=row['close'], time=row['time'], profit=None)
+                self.open_position(row['close'], 'long', row['time'])
+            elif row['Predicted Movement'] == -1 and self.position != 'short':
+                if self.position:  # If there is an existing position, close it
+                    self.close_position(current_price=row['close'], time=row['time'], profit=None)
+                self.open_position(row['close'], 'short', row['time'])
+            else:
+                self.log_trade('Holding', row['close'], row['time'] ,profit=None)
+
+    def plot_balance_over_time(self, folder_name):
+        # Create a DataFrame from the trade history
+        trades = pd.DataFrame(self.trade_history)
+        trades.set_index('time', inplace=True)  # Set time as the index
+
+        # Plotting
+        plt.figure(figsize=(10, 5))
+        trades['balance'].plot(title='Balance Over Time', color='blue', marker='o')
+        plt.xlabel('Time')
+        plt.ylabel('Balance ($)')
+        plt.grid(True)
+        # Save the plot as a PNG file
+        plot_path = os.path.join(folder_name, 'balance_over_time_backtest.png')
+        plt.savefig(plot_path)
+        plt.close()  # Close the plot figure to free up memory
 
 def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
 
@@ -122,19 +255,13 @@ def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
 
 class IndicatorTransformer(BaseEstimator, TransformerMixin):
     def __init__(self, sma_short_length=50, sma_long_length=200, ema_medium_length=50, ema_long_length=200,
-                 ema_short_length=9, ema_fast_length=21, original_bollinger_length=20,
-                 original_bollinger_std=2, bollinger_length=12, bollinger_std_dev=1.5, sma_trend_length=50, window=9):
+                 ema_short_length=9, ema_fast_length=21, window=9):
         self.sma_short_length = sma_short_length
         self.sma_long_length = sma_long_length
         self.ema_medium_length = ema_medium_length
         self.ema_long_length = ema_long_length
         self.ema_short_length = ema_short_length
         self.ema_fast_length = ema_fast_length
-        self.original_bollinger_length = original_bollinger_length
-        self.original_bollinger_std = original_bollinger_std
-        self.bollinger_length = bollinger_length
-        self.bollinger_std_dev = bollinger_std_dev
-        self.sma_trend_length = sma_trend_length
         self.window = window
 
     def fit(self, X, y=None):
@@ -143,27 +270,56 @@ class IndicatorTransformer(BaseEstimator, TransformerMixin):
     def transform(self, X):
         X = X.copy()
         # Implementing SMA, EMA, and Bollinger Bands
-        X[f'SMA_{self.sma_short_length}'] = ta.sma(X['close'], length=self.sma_short_length)
-        X[f'SMA_{self.sma_long_length}'] = ta.sma(X['close'], length=self.sma_long_length)
-        X[f'EMA_{self.ema_medium_length}'] = ta.ema(X['close'], length=self.ema_medium_length)
-        X[f'EMA_{self.ema_long_length}'] = ta.ema(X['close'], length=self.ema_long_length)
-        X[f'EMA_{self.ema_short_length}'] = ta.ema(X['close'], length=self.ema_short_length)
-        X[f'EMA_{self.ema_fast_length}'] = ta.ema(X['close'], length=self.ema_fast_length)
-        original_bollinger = ta.bbands(X['close'], length=self.original_bollinger_length, std=self.original_bollinger_std)
-        X['Upper Band'] = original_bollinger['BBU_20_2.0']
-        X['Lower Band'] = original_bollinger['BBL_20_2.0']
-        updated_bollinger = ta.bbands(X['close'], length=self.bollinger_length, std=self.bollinger_std_dev)
-        X['Lower Band Scalping'] = updated_bollinger['BBL_12_1.5']
-        X['Middle Band Scalping'] = updated_bollinger['BBM_12_1.5']
-        X['Upper Band Scalping'] = updated_bollinger['BBU_12_1.5']
+        X[f'SMA_Short'] = ta.sma(X['close'], length=self.sma_short_length)
+        X[f'SMA_Long'] = ta.sma(X['close'], length=self.sma_long_length)
+        X[f'EMA_Medium'] = ta.ema(X['close'], length=self.ema_medium_length)
+        X[f'EMA_Long'] = ta.ema(X['close'], length=self.ema_long_length)
+        X[f'EMA_Short'] = ta.ema(X['close'], length=self.ema_short_length)
+        X[f'EMA_Fast'] = ta.ema(X['close'], length=self.ema_fast_length)
+
         macd = ta.macd(X['close'])
         X['MACD'] = macd['MACD_12_26_9']
         X['Signal_Line'] = macd['MACDs_12_26_9']
-        X[f'RSI_{self.window}'] = ta.rsi(X['close'], length=self.window).round(2)
-        X.dropna(inplace=True)
+        X[f'RSI'] = ta.rsi(X['close'], length=self.window).round(2)
+
+        # Ensure all data manipulations have been completed before dropping NA
+        pd.set_option('future.no_silent_downcasting', True)
+        X.fillna(0, inplace=True)
+
         return X
 
-def get_data():
+def calculate_indicators(data, **kwargs):
+        data = data.copy()
+        # Assuming your indicators function can handle these keyword arguments:
+        sma_short_length = kwargs.get('sma_short_length') 
+        sma_long_length = kwargs.get('sma_long_length')
+        ema_medium_length = kwargs.get('ema_medium_length')
+        ema_long_length = kwargs.get('ema_long_length')
+        ema_short_length = kwargs.get('ema_short_length')
+        ema_fast_length = kwargs.get('ema_fast_length')
+        window = kwargs.get('window')
+
+        data = data.copy()
+        # Implementing SMA, EMA, and Bollinger Bands
+        data[f'SMA_Short'] = ta.sma(data['close'], length=sma_short_length)
+        data[f'SMA_Long'] = ta.sma(data['close'], length=sma_long_length)
+        data[f'EMA_Medium'] = ta.ema(data['close'], length=ema_medium_length)
+        data[f'EMA_Long'] = ta.ema(data['close'], length=ema_long_length)
+        data[f'EMA_Short'] = ta.ema(data['close'], length=ema_short_length)
+        data[f'EMA_Fast'] = ta.ema(data['close'], length=ema_fast_length)
+
+        macd = ta.macd(data['close'])
+        data['MACD'] = macd['MACD_12_26_9']
+        data['Signal_Line'] = macd['MACDs_12_26_9']
+        data[f'RSI'] = ta.rsi(data['close'], length=window).round(2)
+
+        # Ensure all data manipulations have been completed before dropping NA
+        pd.set_option('future.no_silent_downcasting', True)
+        data.fillna(0, inplace=True)
+
+        return data
+
+def get_data(choice=None, symbol=None,timeframe=None):
     # Retrieve and store the current date
     current_date = str(datetime.now().date())
     current_date_datetime = datetime.now().date()
@@ -182,16 +338,21 @@ def get_data():
     start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
     end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
 
-    # Prompt the user for the desired timeframe for analysis and standardize the input
-    timeframe_str = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
-    # Prompt the user for the currency pair they're interested in and standardize the input
-    Pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
-
     training_start_date = "2023-01-01"
     training_end_date = current_date
 
-    # Fetch and prepare the FX data for the specified currency pair and timeframe
-    eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
+    if choice == '2':
+        Pair = symbol
+        timeframe_str = timeframe
+        # Fetch and prepare the FX data for the specified currency pair and timeframe
+        eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
+    else:
+        # Prompt the user for the desired timeframe for analysis and standardize the input
+        timeframe_str = input("Enter the currency pair (e.g., Daily, 1H): ").strip().upper()
+        # Prompt the user for the currency pair they're interested in and standardize the input
+        Pair = input("Enter the currency pair (e.g., GBPUSD, EURUSD): ").strip().upper()
+            # Fetch and prepare the FX data for the specified currency pair and timeframe
+        eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
     calculate_target(eur_usd_data)
 
@@ -202,53 +363,7 @@ def get_data():
 
     return dataset, timeframe_str, Pair
 
-def get_data_multiple(Pair, timeframe_str):
-    # Retrieve and store the current date
-    current_date = str(datetime.now().date())
-    current_date_datetime = datetime.now().date()
-
-    # Calculate the date for one month before the current date
-    one_month_before = current_date_datetime - relativedelta(months=1)
-    # Convert to string if needed
-    one_month_before_str = str(one_month_before)
-
-    # Hardcoded start date for strategy evaluation
-    strategy_start_date_all = "1971-01-04"
-    # Use the current date as the end date for strategy evaluation
-    strategy_end_date_all = current_date
-
-    # Convert string representation of dates to datetime objects for further processing
-    start_date_all = datetime.strptime(strategy_start_date_all, "%Y-%m-%d")
-    end_date_all = datetime.strptime(strategy_end_date_all, "%Y-%m-%d")
-
-    training_start_date = "2023-01-01"
-    training_end_date = current_date
-
-    # Fetch and prepare the FX data for the specified currency pair and timeframe
-    eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
-
-    eur_usd_data = calculate_target(eur_usd_data) 
-
-    # Filter the EUR/USD data for the in-sample training period
-    dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
-
-    dataset = dataset.fillna(0)
-
-    return dataset
-
 def split_and_save_dataset(dataset, timeframe, pair):
-    """
-    Splits the dataset into training and validation sets with an 80/20 split,
-    cleans up old related CSV files, and saves the new splits to CSV files.
-
-    Args:
-    dataset (pd.DataFrame): The full dataset to split.
-    timeframe (str): Description of the timeframe, used in file naming.
-    pair (str): Currency pair or dataset identifier, used in file naming.
-
-    Returns:
-    tuple: A tuple containing two DataFrames (training_set, validation_set).
-    """
     if len(dataset) < 10:
         raise ValueError("Dataset is too small to split effectively.")
 
@@ -257,24 +372,24 @@ def split_and_save_dataset(dataset, timeframe, pair):
     
     # Split the dataset into training and validation sets
     training_set = dataset.iloc[:split_index]
-    validation_set = dataset.iloc[split_index:]
+    testing_set = dataset.iloc[split_index:]
 
     # Clean up existing CSV files related to previous runs
-    file_patterns = [f'Full_data_{pair}_{timeframe}.csv', 
-                     f'training_{pair}_{timeframe}_data.csv', 
-                     f'validation_{pair}_{timeframe}_data.csv']
+    file_patterns = [f'Full_data.csv', 
+                     f'training.csv', 
+                     f'testing.csv']
     for pattern in file_patterns:
         for file in glob.glob(pattern):
             os.remove(file)
 
     # Save the datasets into CSV files
-    dataset.to_csv(f'Full_data_{pair}_{timeframe}.csv', index=True)
-    training_set.to_csv(f'training_{pair}_{timeframe}_data.csv', index=True)
-    validation_set.to_csv(f'validation_{pair}_{timeframe}_data.csv', index=True)
+    dataset.to_csv(f'Full_data.csv', index=True)
+    training_set.to_csv(f'training.csv', index=True)
+    testing_set.to_csv(f'testing.csv', index=True)
     
-    return training_set, validation_set
+    return training_set, testing_set
 
-def multiple():
+def multiple(choice):
     forex_pairs = [
     'GBPUSD', 'USDCHF', 'USDCAD', 'AUDUSD', 'AUDNZD', 'AUDCAD',
     'AUDCHF', 'GBPCAD', 'NZDUSD', 'EURGBP', 'EURAUD',
@@ -287,8 +402,8 @@ def multiple():
     for pair in forex_pairs:
         print(f"Processing {pair} on {timeframe_str}")
         try:
-            data = get_data_multiple(pair, timeframe_str)
-            train_and_evaluate_models(data, timeframe_str, pair)
+            data,_,_ = get_data(choice,pair, timeframe_str)
+            train_and_evaluate_models_optuna(data, timeframe_str, pair)
         except Exception as e:
             print(f"Failed to process {pair}: {str(e)}")
 
@@ -309,9 +424,10 @@ def calculate_target(data):
     data = data.dropna()
 
 def train_and_evaluate_models(data, timeframe, Pair):
+    training_set, _ =  split_and_save_dataset(data, timeframe, Pair)
     # Prepare data
-    X = data.drop('Actual Movement', axis=1)
-    y = data['Actual Movement']
+    X = training_set.drop('Actual Movement', axis=1)
+    y = training_set['Actual Movement']
 
     # Define the pipeline with the IndicatorTransformer
     pipeline = Pipeline([
@@ -329,14 +445,12 @@ def train_and_evaluate_models(data, timeframe, Pair):
             'indicators__ema_long_length': [150, 200, 250],
             'indicators__ema_short_length': [5, 9, 12],
             'indicators__ema_fast_length': [18, 21, 24],
-            'indicators__original_bollinger_length': [15, 20, 25],
-            'indicators__original_bollinger_std': [1.5, 2, 2.5],
-            'indicators__bollinger_length': [10, 12, 15],
-            'indicators__bollinger_std_dev': [1, 1.5, 2],
             'indicators__window': [7, 9, 12],
+            'scaler': [StandardScaler(), MinMaxScaler()],
             'classifier': [LogisticRegression()],
             'classifier__C': [0.1, 1.0, 10.0],
-            'classifier__penalty': ['l2']
+            'classifier__penalty': ['l2'],
+            'classifier__max_iter': [100, 200, 500, 1000, 1500, 2000]  # Varying numbers of iterations
         },
         {
             'indicators__sma_short_length': [30, 50, 70],
@@ -345,10 +459,6 @@ def train_and_evaluate_models(data, timeframe, Pair):
             'indicators__ema_long_length': [150, 200, 250],
             'indicators__ema_short_length': [5, 9, 12],
             'indicators__ema_fast_length': [18, 21, 24],
-            'indicators__original_bollinger_length': [15, 20, 25],
-            'indicators__original_bollinger_std': [1.5, 2, 2.5],
-            'indicators__bollinger_length': [10, 12, 15],
-            'indicators__bollinger_std_dev': [1, 1.5, 2],
             'indicators__window': [7, 9, 12],
             'classifier': [RandomForestClassifier()],
             'classifier__n_estimators': [100, 200],
@@ -361,19 +471,16 @@ def train_and_evaluate_models(data, timeframe, Pair):
             'indicators__ema_long_length': [150, 200, 250],
             'indicators__ema_short_length': [5, 9, 12],
             'indicators__ema_fast_length': [18, 21, 24],
-            'indicators__original_bollinger_length': [15, 20, 25],
-            'indicators__original_bollinger_std': [1.5, 2, 2.5],
-            'indicators__bollinger_length': [10, 12, 15],
-            'indicators__bollinger_std_dev': [1, 1.5, 2],
             'indicators__window': [7, 9, 12],
+            'scaler': [StandardScaler(), MinMaxScaler()],
             'classifier': [SVC()],
             'classifier__C': [0.1, 1, 10],
             'classifier__kernel': ['linear', 'rbf']
         }
     ]
 
-    # Perform grid search
-    grid_search = GridSearchCV(pipeline, param_grid, cv=TimeSeriesSplit(n_splits=5), scoring='accuracy', verbose=1)
+    # Perform grid search # GridSearchCV # RandomizedSearchCV
+    grid_search = RandomizedSearchCV(pipeline, param_grid, cv=TimeSeriesSplit(n_splits=5), scoring='accuracy', verbose=1)
     grid_search.fit(X, y)
     
     best_model = grid_search.best_estimator_
@@ -390,21 +497,24 @@ def train_and_evaluate_models(data, timeframe, Pair):
     csv_path = 'best_model_details.csv'
     best_model_details.to_csv(csv_path, index=False)
 
-    # Split the data into training and validation sets
-    training_set, validation_set = split_and_save_dataset(data, timeframe, Pair)
+    data_indicators = calculate_indicators(data, **best_model_params)
+
+    _, testing_set =  split_and_save_dataset(data_indicators, timeframe, Pair)
     
-    X_train = training_set.drop('Actual Movement', axis=1)
-    y_train = training_set['Actual Movement']
-    X_test = validation_set.drop('Actual Movement', axis=1)
-    y_test = validation_set['Actual Movement']
+    X_test = testing_set.drop('Actual Movement', axis=1)
+    y_test = testing_set['Actual Movement']
 
     # Evaluate the best model on the validation set
     y_pred = best_model.predict(X_test)
     accuracy = accuracy_score(y_test, y_pred)
+
     print(f'Model Accuracy for evaluation on validation data: {accuracy:.2%}')
+
+    scaler_path = f'scaler_{Pair}_{timeframe}.joblib'
 
     # Save the best model
     joblib.dump(best_model, f'best_model_{Pair}_{timeframe}.joblib')
+    joblib.dump(best_model.named_steps['scaler'], scaler_path)
 
     # Export results
     results_df = pd.DataFrame({
@@ -414,27 +524,267 @@ def train_and_evaluate_models(data, timeframe, Pair):
         'Predicted Movement': y_pred
     })
     results_df.to_csv('predicted_movements.csv', index=False)
-    print("Results exported to 'predicted_movements.csv'.")
 
-    # Optionally, save and display feature importances if your model supports it
-    if hasattr(best_model.named_steps['classifier'], 'coef_'):
-        importances = best_model.named_steps['classifier'].coef_[0]
-        features = X_train.columns
-        feature_importance = pd.DataFrame({'Feature': features, 'Importance': importances})
-        feature_importance.sort_values(by='Importance', ascending=False, inplace=True)
-        print("Feature importances:\n", feature_importance)
+    test_trade(accuracy, Pair, timeframe)
 
-def plot_feature_importances(feature_importances):
-    # Sort features by their importance
-    feature_importances = feature_importances.sort_values(by='Importance', ascending=True)
+def train_and_evaluate_models_optuna(data, timeframe, Pair):
+    def objective(trial):
+        # Split data
+        training_set, _ = split_and_save_dataset(data, timeframe, Pair)
+        X = training_set.drop('Actual Movement', axis=1)
+        y = training_set['Actual Movement']
+
+        # Hyperparameters for IndicatorTransformer
+        sma_short_length = trial.suggest_categorical('sma_short_length', [30, 50, 70])
+        sma_long_length = trial.suggest_categorical('sma_long_length', [150, 200, 250])
+        ema_medium_length = trial.suggest_categorical('ema_medium_length', [30, 50, 70])
+        ema_long_length = trial.suggest_categorical('ema_long_length', [150, 200, 250])
+        ema_short_length = trial.suggest_categorical('ema_short_length', [5, 9, 12])
+        ema_fast_length = trial.suggest_categorical('ema_fast_length', [18, 21, 24])
+        window = trial.suggest_categorical('window', [7, 9, 12])
+
+        # Choose a scaler
+        scaler = trial.suggest_categorical('scaler', ['StandardScaler', 'MinMaxScaler'])
+        if scaler == 'StandardScaler':
+            scaler = StandardScaler()
+        else:
+            scaler = MinMaxScaler()
+
+        # Hyperparameters to tune for classifiers
+        classifier_name = trial.suggest_categorical('classifier', ['LogisticRegression', 'RandomForest', 'SVC'])
+
+        if classifier_name == 'LogisticRegression':
+            C = trial.suggest_loguniform('lr_C', 1e-3, 1e3)
+            max_iter = trial.suggest_int('lr_max_iter', 100, 2000)
+            classifier = LogisticRegression(C=C, max_iter=max_iter)
+        elif classifier_name == 'RandomForest':
+            n_estimators = trial.suggest_int('rf_n_estimators', 100, 1000)
+            max_features = trial.suggest_categorical('rf_max_features', ['sqrt', 'log2'])
+            classifier = RandomForestClassifier(n_estimators=n_estimators, max_features=max_features)
+        elif classifier_name == 'SVC':
+            C = trial.suggest_loguniform('svc_C', 1e-3, 1e3)
+            kernel = trial.suggest_categorical('svc_kernel', ['linear', 'rbf'])
+            classifier = SVC(C=C, kernel=kernel)
+
+        # Setup the pipeline
+        pipeline = Pipeline([
+            ('indicators', IndicatorTransformer(sma_short_length=sma_short_length, sma_long_length=sma_long_length,
+                                                ema_medium_length=ema_medium_length, ema_long_length=ema_long_length,
+                                                ema_short_length=ema_short_length, ema_fast_length=ema_fast_length,
+                                                window=window)),
+            ('scaler', scaler),
+            ('classifier', classifier)
+        ])
+
+        # Perform cross-validation
+        score = cross_val_score(pipeline, X, y, cv=TimeSeriesSplit(n_splits=5), scoring='accuracy')
+        trial.set_user_attr('pipeline', pipeline)
+        return score.mean()
+
+    # Create a study object and optimize the objective function
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=100)
+
+    # Retrieve the best model
+    best_params = study.best_params
+    best_score = study.best_value
+    best_pipeline = study.best_trial.user_attrs['pipeline']
+    best_scaler = best_pipeline.named_steps['scaler']
+
+    # Convert the best parameters dictionary to a DataFrame
+    best_params_df = pd.DataFrame([best_params])
+
+    # Add the best score to the DataFrame
+    best_params_df['Best Score'] = best_score
+
+    # Define a path for the CSV file
+    csv_path = 'best_model_params.csv'
+
+    # Save the DataFrame to a CSV file
+    best_params_df.to_csv(csv_path, index=False)
+
+    # Re-train the best model on the entire dataset
+    training_set, testing_set = split_and_save_dataset(data, timeframe, Pair)
+    X_train = training_set.drop('Actual Movement', axis=1)
+    y_train = training_set['Actual Movement']
+
+    best_pipeline.fit(X_train, y_train)  # Correctly reference the training data
+
+    X_test = testing_set.drop('Actual Movement', axis=1)
+    y_test = testing_set['Actual Movement']
+
+    # Evaluate the best model on the validation set
+    y_pred = best_pipeline.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+
+    print(f'Model Accuracy for evaluation on validation data: {accuracy:.2%}')
+
+    # Save the best model
+    joblib.dump(best_pipeline, f'best_model_{Pair}_{timeframe}.joblib')
+    # Save the scaler
+    joblib.dump(best_scaler, f'scaler_{Pair}_{timeframe}.joblib')
+
+    # Export results
+    results_df = pd.DataFrame({
+        'Date': X_test.index,
+        'Close Price': X_test['close'],
+        'Actual Movement': y_test,
+        'Predicted Movement': y_pred
+    })
+    results_df.to_csv('predicted_movements.csv', index=False)
+
+    # Additional function that may be defined elsewhere
+    test_trade(accuracy, Pair, timeframe)
+
+def analyze_pair_data(df):
+    """ Analyze data for a single currency pair and return key metrics. """
+    # Make a copy of the DataFrame to avoid SettingWithCopyWarning when modifying data
+    df_copy = df.copy()
+
+    # Ensure 'time' column is in datetime format
+    df_copy['time'] = pd.to_datetime(df_copy['time'])
+
+    # Calculate daily profit
+    daily_profit = df_copy.groupby('time')['profit'].sum()
+
+    worst_daily_pnl = df_copy.groupby('time')['worst_case_pnl'].sum()
+
+    # Initial settings for simulation
+    initial_balance = 10000
+    upper_reset_threshold = 11000
+    lower_reset_threshold = 9000
+    upper_reset_count = 0
+    lower_reset_count = 0
+
+    daily_max_loss_reset_threshold = 9500
+    daily_max_loss_count = 0
+
+    # Calculate cumulative balance with resets
+    balances = [initial_balance]
+    for profit in daily_profit:
+        new_balance = balances[-1] + profit
+        if new_balance >= upper_reset_threshold:
+            balances.append(initial_balance)  # Reset to initial balance
+            upper_reset_count += 1
+        elif new_balance <= lower_reset_threshold:
+            balances.append(initial_balance)  # Reset to initial balance
+            lower_reset_count += 1
+        else:
+            balances.append(new_balance)
+
+    balances_2 = [initial_balance]
+
+    for worst_daily in worst_daily_pnl:
+        new_balance = balances_2[-1] + worst_daily
+        if new_balance <= daily_max_loss_reset_threshold:
+            balances_2.append(initial_balance)
+            daily_max_loss_count += 1
+        elif new_balance <= lower_reset_threshold:
+            balances.append(initial_balance)  # Reset to initial balance
+            lower_reset_count += 1
+        else:
+            balances_2.append(new_balance)
+
+    total_resets = upper_reset_count + lower_reset_count + daily_max_loss_count
+    if total_resets > 0:
+        probability_of_passing = (upper_reset_count / total_resets) * 100
+    else:
+        probability_of_passing = 0  # Set probability to 0 (or another appropriate value) when no resets have occurred
+
+    return {
+        'TotalCumulativeProfit': daily_profit.sum(),
+        'ProbabilityOfPassing': probability_of_passing,
+        'PositiveResets': upper_reset_count,
+        'NegativeResets': lower_reset_count,
+        'daily_max_loss_count': daily_max_loss_count
+    }
+
+def compute_probabilities(df):
+    result = []
+    analysis_results = analyze_pair_data(df)
+    result.append({
+        'Probability': analysis_results['ProbabilityOfPassing'],
+        'TotalProfit': analysis_results['TotalCumulativeProfit'],
+        'CountPositiveReset': analysis_results['PositiveResets'],
+        'CountNegativeReset': analysis_results['NegativeResets'],
+        'CountDailyLossReset': analysis_results['daily_max_loss_count']
+    })
     
-    # Create barh plot
-    plt.figure(figsize=(10, 8))
-    plt.barh(feature_importances['Feature'], feature_importances['Importance'], color='skyblue')
-    plt.xlabel('Importance')
-    plt.title('Feature Importance')
-    plt.savefig('feature_importance.png')
-    plt.close()
+    result_df = pd.DataFrame(result)
+    return result_df.sort_values(by='Probability', ascending=False)
+
+def perform_analysis():
+    combined_df = pd.read_csv('trade_history_backtest.csv')
+    probability_rankings = compute_probabilities(combined_df)
+    # Get the current working directory
+    current_directory = os.getcwd()
+    # List all subdirectories in the current directory
+    all_subdirs = [os.path.join(current_directory, d) for d in os.listdir(current_directory) if os.path.isdir(os.path.join(current_directory, d))]
+
+    # Find the most recent directory
+    most_recent_dir = max(all_subdirs, key=os.path.getmtime)
+    
+    probability_rankings.to_csv('forex_pair_probability_rankings.csv', index=False)
+
+    highest_probability = probability_rankings['Probability'].max()
+
+    return highest_probability
+
+def test_trade(accuracy, Pair, timeframe):
+    predicted_movements = pd.read_csv('predicted_movements.csv', index_col='Date', parse_dates=True)
+    # Reading the second CSV and setting the date column as index
+    testing = pd.read_csv('testing.csv', index_col='time', parse_dates=True)
+
+    columns_from_predicted_movements = predicted_movements[['Predicted Movement']]
+    columns_testing = testing[['high', 'close', 'low']]
+
+    # Concatenating the selected columns along the axis=1 (side by side), matching by index (date)
+    concatenated_columns = pd.concat([columns_from_predicted_movements, columns_testing], axis=1)
+
+    concatenated_columns_reset = concatenated_columns.reset_index()
+
+    backtest_data = concatenated_columns_reset.rename(columns={'index': 'time'})
+
+    initial_balance=10000
+    leverage=30
+    transaction_cost=0.0002
+    lot_size = 10000
+
+    folder_name = os.getcwd()
+
+    data_csv_filename = os.path.join(folder_name, 'data_backtest.csv')
+    backtest_data.to_csv(data_csv_filename)
+
+    trader = ForexTradingSimulator(
+        initial_balance,
+        leverage,
+        transaction_cost,
+        lot_size,
+    )
+    
+    trader.simulate_trading(backtest_data)
+
+    trader.plot_balance_over_time(folder_name)
+
+    trade_history_df = pd.DataFrame(trader.trade_history)
+
+    trade_history_filename = os.path.join(folder_name, 'trade_history_backtest.csv')
+    trade_history_df.to_csv(trade_history_filename)
+
+    highest_probability = perform_analysis()
+
+    print(highest_probability)
+
+    save_directory = f'model_{accuracy:.2%}_{Pair}_{timeframe}'
+
+    if not os.path.exists(save_directory):
+        os.makedirs(save_directory)
+    
+    # Save all files except the specified ones
+    exclude_files = ['things to do.txt', 'MLP.py', 'test_1.py', 'Chart.csv', 'Chart_1h.csv', 'Chart_Latest.csv', 'LSTM.py', 'RNN.py', 'XGboost.py', 'manual.py', 'logistic.py']
+    for file in os.listdir('.'):
+        if file not in exclude_files and os.path.isfile(file):
+            shutil.move(file, os.path.join(save_directory, file))
 
 def main_menu():
     while True:
@@ -446,10 +796,10 @@ def main_menu():
 
         if choice == '1':
             data, timeframe, Pair = get_data()  # Fetch and prepare data
-            train_and_evaluate_models(data, timeframe, Pair)
+            train_and_evaluate_models_optuna(data, timeframe, Pair)
             break
         elif choice == '2':
-            multiple()
+            multiple(choice)
             break
         else:
             print("Invalid choice. Please enter 1, 2, 3, 4 or 5.")
