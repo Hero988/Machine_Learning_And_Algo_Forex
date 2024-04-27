@@ -16,7 +16,14 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
-
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+import time
+import shutil
+import joblib
+from sklearn.model_selection import GridSearchCV
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline
 
 def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
 
@@ -113,6 +120,49 @@ def fetch_fx_data_mt5(symbol, timeframe_str, start_date, end_date):
     # Return the prepared DataFrame containing the rates
     return rates_frame
 
+class IndicatorTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, sma_short_length=50, sma_long_length=200, ema_medium_length=50, ema_long_length=200,
+                 ema_short_length=9, ema_fast_length=21, original_bollinger_length=20,
+                 original_bollinger_std=2, bollinger_length=12, bollinger_std_dev=1.5, sma_trend_length=50, window=9):
+        self.sma_short_length = sma_short_length
+        self.sma_long_length = sma_long_length
+        self.ema_medium_length = ema_medium_length
+        self.ema_long_length = ema_long_length
+        self.ema_short_length = ema_short_length
+        self.ema_fast_length = ema_fast_length
+        self.original_bollinger_length = original_bollinger_length
+        self.original_bollinger_std = original_bollinger_std
+        self.bollinger_length = bollinger_length
+        self.bollinger_std_dev = bollinger_std_dev
+        self.sma_trend_length = sma_trend_length
+        self.window = window
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        # Implementing SMA, EMA, and Bollinger Bands
+        X[f'SMA_{self.sma_short_length}'] = ta.sma(X['close'], length=self.sma_short_length)
+        X[f'SMA_{self.sma_long_length}'] = ta.sma(X['close'], length=self.sma_long_length)
+        X[f'EMA_{self.ema_medium_length}'] = ta.ema(X['close'], length=self.ema_medium_length)
+        X[f'EMA_{self.ema_long_length}'] = ta.ema(X['close'], length=self.ema_long_length)
+        X[f'EMA_{self.ema_short_length}'] = ta.ema(X['close'], length=self.ema_short_length)
+        X[f'EMA_{self.ema_fast_length}'] = ta.ema(X['close'], length=self.ema_fast_length)
+        original_bollinger = ta.bbands(X['close'], length=self.original_bollinger_length, std=self.original_bollinger_std)
+        X['Upper Band'] = original_bollinger['BBU_20_2.0']
+        X['Lower Band'] = original_bollinger['BBL_20_2.0']
+        updated_bollinger = ta.bbands(X['close'], length=self.bollinger_length, std=self.bollinger_std_dev)
+        X['Lower Band Scalping'] = updated_bollinger['BBL_12_1.5']
+        X['Middle Band Scalping'] = updated_bollinger['BBM_12_1.5']
+        X['Upper Band Scalping'] = updated_bollinger['BBU_12_1.5']
+        macd = ta.macd(X['close'])
+        X['MACD'] = macd['MACD_12_26_9']
+        X['Signal_Line'] = macd['MACDs_12_26_9']
+        X[f'RSI_{self.window}'] = ta.rsi(X['close'], length=self.window).round(2)
+        X.dropna(inplace=True)
+        return X
+
 def get_data():
     # Retrieve and store the current date
     current_date = str(datetime.now().date())
@@ -143,14 +193,14 @@ def get_data():
     # Fetch and prepare the FX data for the specified currency pair and timeframe
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
-    calculate_indicators(eur_usd_data)
+    calculate_target(eur_usd_data)
 
     # Filter the EUR/USD data for the in-sample training period
     dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
 
     dataset = dataset.fillna(0)
 
-    return dataset
+    return dataset, timeframe_str, Pair
 
 def get_data_multiple(Pair, timeframe_str):
     # Retrieve and store the current date
@@ -177,7 +227,7 @@ def get_data_multiple(Pair, timeframe_str):
     # Fetch and prepare the FX data for the specified currency pair and timeframe
     eur_usd_data = fetch_fx_data_mt5(Pair, timeframe_str, start_date_all, end_date_all)
 
-    eur_usd_data = calculate_indicators(eur_usd_data) 
+    eur_usd_data = calculate_target(eur_usd_data) 
 
     # Filter the EUR/USD data for the in-sample training period
     dataset = eur_usd_data[(eur_usd_data.index >= training_start_date) & (eur_usd_data.index <= training_end_date)]
@@ -186,58 +236,43 @@ def get_data_multiple(Pair, timeframe_str):
 
     return dataset
 
-def calculate_indicators(data, bollinger_length=12, bollinger_std_dev=1.5, sma_trend_length=50, window=9):
-    # Calculate the 50-period simple moving average of the 'close' price
-    data['SMA_50'] = ta.sma(data['close'], length=50)
-    # Calculate the 200-period simple moving average of the 'close' price
-    data['SMA_200'] = ta.sma(data['close'], length=200)
+def split_and_save_dataset(dataset, timeframe, pair):
+    """
+    Splits the dataset into training and validation sets with an 80/20 split,
+    cleans up old related CSV files, and saves the new splits to CSV files.
+
+    Args:
+    dataset (pd.DataFrame): The full dataset to split.
+    timeframe (str): Description of the timeframe, used in file naming.
+    pair (str): Currency pair or dataset identifier, used in file naming.
+
+    Returns:
+    tuple: A tuple containing two DataFrames (training_set, validation_set).
+    """
+    if len(dataset) < 10:
+        raise ValueError("Dataset is too small to split effectively.")
+
+    # Calculate the split index for an 80/20 split
+    split_index = int(len(dataset) * 0.8)
     
-    # Calculate the 50-period exponential moving average of the 'close' price
-    data['EMA_50'] = ta.ema(data['close'], length=50)
-    # Calculate the 200-period exponential moving average of the 'close' price
-    data['EMA_200'] = ta.ema(data['close'], length=200)
+    # Split the dataset into training and validation sets
+    training_set = dataset.iloc[:split_index]
+    validation_set = dataset.iloc[split_index:]
 
-    data['previous_close'] = data['close'].shift(1)
+    # Clean up existing CSV files related to previous runs
+    file_patterns = [f'Full_data_{pair}_{timeframe}.csv', 
+                     f'training_{pair}_{timeframe}_data.csv', 
+                     f'validation_{pair}_{timeframe}_data.csv']
+    for pattern in file_patterns:
+        for file in glob.glob(pattern):
+            os.remove(file)
 
-    # Calculate the 9-period exponential moving average for scalping strategies
-    data['EMA_9'] = ta.ema(data['close'], length=9)
-    # Calculate the 21-period exponential moving average for scalping strategies
-    data['EMA_21'] = ta.ema(data['close'], length=21)
+    # Save the datasets into CSV files
+    dataset.to_csv(f'Full_data_{pair}_{timeframe}.csv', index=True)
+    training_set.to_csv(f'training_{pair}_{timeframe}_data.csv', index=True)
+    validation_set.to_csv(f'validation_{pair}_{timeframe}_data.csv', index=True)
     
-    # Generate original Bollinger Bands with a 20-period SMA and 2 standard deviations
-    original_bollinger = ta.bbands(data['close'], length=20, std=2)
-    # The 20-period simple moving average for the middle band
-    data['SMA_20'] = ta.sma(data['close'], length=20)
-    # Upper and lower bands from the original Bollinger Bands calculation
-    data['Upper Band'] = original_bollinger['BBU_20_2.0']
-    data['Lower Band'] = original_bollinger['BBL_20_2.0']
-
-    # Generate updated Bollinger Bands for scalping with custom length and standard deviation
-    updated_bollinger = ta.bbands(data['close'], length=bollinger_length, std=bollinger_std_dev)
-    # Assign lower, middle, and upper bands for scalping
-    data['Lower Band Scalping'], data['Middle Band Scalping'], data['Upper Band Scalping'] = updated_bollinger['BBL_'+str(bollinger_length)+'_'+str(bollinger_std_dev)], ta.sma(data['close'], length=bollinger_length), updated_bollinger['BBU_'+str(bollinger_length)+'_'+str(bollinger_std_dev)]
-    
-    # Calculate the MACD indicator and its signal line
-    macd = ta.macd(data['close'])
-    data['MACD'] = macd['MACD_12_26_9']
-    data['Signal_Line'] = macd['MACDs_12_26_9']
-    
-    # Calculate the Relative Strength Index (RSI) with the specified window length
-    data[f'RSI_{window}'] = ta.rsi(data['close'], length=window).round(2)
-
-    # Calculate a 5-period RSI for scalping strategies
-    data[f'RSI_5 Scalping'] = ta.rsi(data['close'], length=5).round(2)
-
-    # Calculate a simple moving average for trend analysis in scalping strategies
-    data[f'SMA_{sma_trend_length}'] = ta.sma(data['close'], length=sma_trend_length)
-
-    # Calculate the Stochastic Oscillator
-    stoch = ta.stoch(data['high'], data['low'], data['close'])
-    data['Stoch_%K'] = stoch['STOCHk_14_3_3']
-    data['Stoch_%D'] = stoch['STOCHd_14_3_3']
-
-    # Return the data with added indicators
-    return data
+    return training_set, validation_set
 
 def multiple():
     forex_pairs = [
@@ -253,54 +288,141 @@ def multiple():
         print(f"Processing {pair} on {timeframe_str}")
         try:
             data = get_data_multiple(pair, timeframe_str)
-            logist_regression(data)
+            train_and_evaluate_models(data, timeframe_str, pair)
         except Exception as e:
             print(f"Failed to process {pair}: {str(e)}")
 
-def logist_regression(data):
-    # https://chat.openai.com/g/g-cKXjWStaE-python/c/62d2f9bb-7a53-469c-bc37-8312a4175155
-    # Feature engineering
+def move_directory(source_directory, destination_directory):
+    # Ensure the destination directory exists where the source directory needs to be moved
+    destination_path = os.path.join(destination_directory, os.path.basename(source_directory))
+    if not os.path.exists(destination_directory):
+        os.makedirs(destination_directory)
+
+    # Move the source directory to the new location
+    shutil.move(source_directory, destination_path)
+
+def calculate_target(data):
     data['close_price_next'] = data['close'].shift(-1)
     data['Actual Movement'] = np.where(data['close_price_next'] > data['close'], 1,
-                                       np.where(data['close_price_next'] < data['close'], -1, 0))
+                                    np.where(data['close_price_next'] < data['close'], -1, 0))
     data.drop(columns=['close_price_next'], inplace=True)
+    data = data.dropna()
 
-    data.dropna(inplace=True)  # Clean NaN values
-    X = data.drop('Actual Movement', axis=1)  # Features
-    y = data['Actual Movement']  # Labels
+def train_and_evaluate_models(data, timeframe, Pair):
+    # Prepare data
+    X = data.drop('Actual Movement', axis=1)
+    y = data['Actual Movement']
 
-    # Model pipeline with L2 regularization
-    model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, penalty='l2', C=0.5))
+    # Define the pipeline with the IndicatorTransformer
+    pipeline = Pipeline([
+        ('indicators', IndicatorTransformer()),
+        ('scaler', StandardScaler()),
+        ('classifier', LogisticRegression())
+    ])
 
-    # Initialize time series cross-validator
-    tscv = TimeSeriesSplit(n_splits=10)
+    # Define parameter grid for grid search
+    param_grid = [
+        {
+            'indicators__sma_short_length': [30, 50, 70],
+            'indicators__sma_long_length': [150, 200, 250],
+            'indicators__ema_medium_length': [30, 50, 70],
+            'indicators__ema_long_length': [150, 200, 250],
+            'indicators__ema_short_length': [5, 9, 12],
+            'indicators__ema_fast_length': [18, 21, 24],
+            'indicators__original_bollinger_length': [15, 20, 25],
+            'indicators__original_bollinger_std': [1.5, 2, 2.5],
+            'indicators__bollinger_length': [10, 12, 15],
+            'indicators__bollinger_std_dev': [1, 1.5, 2],
+            'indicators__window': [7, 9, 12],
+            'classifier': [LogisticRegression()],
+            'classifier__C': [0.1, 1.0, 10.0],
+            'classifier__penalty': ['l2']
+        },
+        {
+            'indicators__sma_short_length': [30, 50, 70],
+            'indicators__sma_long_length': [150, 200, 250],
+            'indicators__ema_medium_length': [30, 50, 70],
+            'indicators__ema_long_length': [150, 200, 250],
+            'indicators__ema_short_length': [5, 9, 12],
+            'indicators__ema_fast_length': [18, 21, 24],
+            'indicators__original_bollinger_length': [15, 20, 25],
+            'indicators__original_bollinger_std': [1.5, 2, 2.5],
+            'indicators__bollinger_length': [10, 12, 15],
+            'indicators__bollinger_std_dev': [1, 1.5, 2],
+            'indicators__window': [7, 9, 12],
+            'classifier': [RandomForestClassifier()],
+            'classifier__n_estimators': [100, 200],
+            'classifier__max_features': ['sqrt', 'log2']
+        },
+        {
+            'indicators__sma_short_length': [30, 50, 70],
+            'indicators__sma_long_length': [150, 200, 250],
+            'indicators__ema_medium_length': [30, 50, 70],
+            'indicators__ema_long_length': [150, 200, 250],
+            'indicators__ema_short_length': [5, 9, 12],
+            'indicators__ema_fast_length': [18, 21, 24],
+            'indicators__original_bollinger_length': [15, 20, 25],
+            'indicators__original_bollinger_std': [1.5, 2, 2.5],
+            'indicators__bollinger_length': [10, 12, 15],
+            'indicators__bollinger_std_dev': [1, 1.5, 2],
+            'indicators__window': [7, 9, 12],
+            'classifier': [SVC()],
+            'classifier__C': [0.1, 1, 10],
+            'classifier__kernel': ['linear', 'rbf']
+        }
+    ]
 
-    # Implement cross-validation specifically for time series data
-    scores = cross_val_score(model, X, y, cv=tscv)
-    print("Cross-validated accuracy scores:", scores)
-    print("Mean cross-validation score: %.2f" % scores.mean())
+    # Perform grid search
+    grid_search = GridSearchCV(pipeline, param_grid, cv=TimeSeriesSplit(n_splits=5), scoring='accuracy', verbose=1)
+    grid_search.fit(X, y)
+    
+    best_model = grid_search.best_estimator_
+    best_model_params = grid_search.best_params_
+    best_model_score = grid_search.best_score_
 
-    # Fit the model on the full dataset for evaluation (might vary depending on the use case)
-    model.fit(X, y)
-    y_pred = model.predict(X)
+    # Create a DataFrame
+    best_model_details = pd.DataFrame([{
+        'Best Model Parameters': str(best_model_params),
+        'Best Model Score': best_model_score
+    }])
 
-    print(f'Model Accuracy for evaluation: {accuracy_score(y, y_pred):.2%}')
+    # Save to CSV
+    csv_path = 'best_model_details.csv'
+    best_model_details.to_csv(csv_path, index=False)
 
-    # Extract coefficients from the LogisticRegression object within the pipeline
-    # Since it's the last step of the pipeline, we access it with -1 index
-    coefficients = model.named_steps['logisticregression'].coef_[0]
-    features = X.columns
-    feature_importance = pd.DataFrame({'Feature': features, 'Importance': coefficients})
+    # Split the data into training and validation sets
+    training_set, validation_set = split_and_save_dataset(data, timeframe, Pair)
+    
+    X_train = training_set.drop('Actual Movement', axis=1)
+    y_train = training_set['Actual Movement']
+    X_test = validation_set.drop('Actual Movement', axis=1)
+    y_test = validation_set['Actual Movement']
 
-    # Normalize the coefficients to positive values for better interpretation and visualization
-    feature_importance['Importance'] = np.abs(feature_importance['Importance'])
-    feature_importance = feature_importance.sort_values(by='Importance', ascending=False)
+    # Evaluate the best model on the validation set
+    y_pred = best_model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f'Model Accuracy for evaluation on validation data: {accuracy:.2%}')
 
-    print("Feature importances:\n", feature_importance)
+    # Save the best model
+    joblib.dump(best_model, f'best_model_{Pair}_{timeframe}.joblib')
 
-    plot_feature_importances(feature_importance)
+    # Export results
+    results_df = pd.DataFrame({
+        'Date': X_test.index,
+        'Close Price': X_test['close'],
+        'Actual Movement': y_test,
+        'Predicted Movement': y_pred
+    })
+    results_df.to_csv('predicted_movements.csv', index=False)
+    print("Results exported to 'predicted_movements.csv'.")
 
-    return model
+    # Optionally, save and display feature importances if your model supports it
+    if hasattr(best_model.named_steps['classifier'], 'coef_'):
+        importances = best_model.named_steps['classifier'].coef_[0]
+        features = X_train.columns
+        feature_importance = pd.DataFrame({'Feature': features, 'Importance': importances})
+        feature_importance.sort_values(by='Importance', ascending=False, inplace=True)
+        print("Feature importances:\n", feature_importance)
 
 def plot_feature_importances(feature_importances):
     # Sort features by their importance
@@ -311,7 +433,8 @@ def plot_feature_importances(feature_importances):
     plt.barh(feature_importances['Feature'], feature_importances['Importance'], color='skyblue')
     plt.xlabel('Importance')
     plt.title('Feature Importance')
-    plt.show()
+    plt.savefig('feature_importance.png')
+    plt.close()
 
 def main_menu():
     while True:
@@ -322,8 +445,8 @@ def main_menu():
         choice = input("Enter your choice (1/2/3/4/5): ")
 
         if choice == '1':
-            data = get_data()  # Fetch and prepare data
-            logist_regression(data)
+            data, timeframe, Pair = get_data()  # Fetch and prepare data
+            train_and_evaluate_models(data, timeframe, Pair)
             break
         elif choice == '2':
             multiple()
